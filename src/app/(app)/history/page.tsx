@@ -32,6 +32,7 @@ import {
   Footprints,
   Gauge,
   Trophy,
+  Goal,
 } from "lucide-react";
 
 type Workout = Database["public"]["Tables"]["workouts"]["Row"];
@@ -132,6 +133,7 @@ const RUN_POOL_STYLE: Record<string, { Icon: typeof Zap; color: string; bg: stri
   speed: { Icon: Zap, color: "text-red-400", bg: "bg-red-500/15" },
   easy: { Icon: Footprints, color: "text-green-400", bg: "bg-green-500/15" },
   threshold: { Icon: Gauge, color: "text-amber-400", bg: "bg-amber-500/15" },
+  soccer: { Icon: Goal, color: "text-sky-400", bg: "bg-sky-500/15" },
 };
 
 export default function HistoryPage() {

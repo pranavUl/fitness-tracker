@@ -22,7 +22,10 @@ import {
   Calendar,
   CalendarX,
   Link2,
+  Goal,
 } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
 import {
   Drawer,
   DrawerContent,
@@ -89,6 +92,11 @@ export default function HomePage() {
   const [workoutTypeOpen, setWorkoutTypeOpen] = useState(false);
   const [gymPickerOpen, setGymPickerOpen] = useState(false);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [soccerOpen, setSoccerOpen] = useState(false);
+  const [soccerMinutes, setSoccerMinutes] = useState("");
+  const [soccerField, setSoccerField] = useState("");
+  const [soccerNotes, setSoccerNotes] = useState("");
+  const [savingSoccer, setSavingSoccer] = useState(false);
   const [variantPickerOpen, setVariantPickerOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<RunTemplate | null>(null);
   const [activeWorkout, setActiveWorkout] = useState<Workout | null>(null);
@@ -376,6 +384,37 @@ export default function HomePage() {
     if (workout) router.push(`/workout/${workout.id}`);
   }
 
+  async function saveSoccer() {
+    const minutes = parseInt(soccerMinutes);
+    if (isNaN(minutes) || minutes <= 0) return;
+    setSavingSoccer(true);
+    try {
+      const user = await getLocalUser(supabase);
+      if (!user) return;
+      await supabase.from("run_sessions").insert({
+        user_id: user.id,
+        source: "manual",
+        name: "Soccer",
+        run_pool: "soccer",
+        started_at: new Date().toISOString(),
+        duration_seconds: minutes * 60,
+        completed: true,
+        notes: soccerNotes.trim() || null,
+        raw_data: {
+          type: "soccer",
+          ...(soccerField.trim() ? { field: soccerField.trim() } : {}),
+        },
+      });
+      setSoccerOpen(false);
+      setSoccerMinutes("");
+      setSoccerField("");
+      setSoccerNotes("");
+      load();
+    } finally {
+      setSavingSoccer(false);
+    }
+  }
+
   function handleSelectTemplate(template: RunTemplate) {
     setTemplatePickerOpen(false);
     if (template.variants) {
@@ -591,11 +630,15 @@ export default function HomePage() {
             ))}
             {todayRuns.map((r) => {
               const done = r.duration_seconds != null;
+              const isSoccer = r.run_pool === "soccer";
+              const soccerFieldName = isSoccer
+                ? ((r.raw_data as { field?: string } | null)?.field ?? null)
+                : null;
               return (
                 <button key={r.id} onClick={() => router.push(`/run/${r.id}`)} className="w-full rounded-2xl border border-border bg-card p-4 text-left transition-all hover:bg-accent active:scale-[0.98]">
                   <div className="flex items-center gap-3">
-                    <div className={`h-9 w-9 rounded-xl flex items-center justify-center shrink-0 ${done ? "bg-green-600/15" : "bg-amber-500/15"}`}>
-                      {done ? <Check className="h-4 w-4 text-green-500" /> : <Footprints className="h-4 w-4 text-amber-400" />}
+                    <div className={`h-9 w-9 rounded-xl flex items-center justify-center shrink-0 ${isSoccer ? "bg-sky-500/15" : done ? "bg-green-600/15" : "bg-amber-500/15"}`}>
+                      {isSoccer ? <Goal className="h-4 w-4 text-sky-400" /> : done ? <Check className="h-4 w-4 text-green-500" /> : <Footprints className="h-4 w-4 text-amber-400" />}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
@@ -603,6 +646,7 @@ export default function HomePage() {
                         {done && !r.completed && <span className="text-[10px] text-amber-400 bg-amber-400/10 px-1.5 rounded">Partial</span>}
                       </div>
                       <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                        {soccerFieldName && <span className="flex items-center gap-0.5"><MapPin className="h-2.5 w-2.5" />{soccerFieldName}</span>}
                         {r.duration_seconds != null && <span className="flex items-center gap-0.5"><Timer className="h-2.5 w-2.5" />{Math.floor(r.duration_seconds / 60)}m</span>}
                       </div>
                     </div>
@@ -640,6 +684,56 @@ export default function HomePage() {
               </div>
               <ChevronRight className="h-4 w-4 text-muted-foreground" />
             </button>
+            <button onClick={() => { setWorkoutTypeOpen(false); setSoccerOpen(true); }} className="flex w-full items-center gap-4 rounded-xl border border-border bg-card p-4 text-left transition-all active:scale-[0.98]">
+              <div className="h-10 w-10 rounded-xl bg-sky-500/15 flex items-center justify-center">
+                <Goal className="h-5 w-5 text-sky-400" />
+              </div>
+              <div className="flex-1">
+                <p className="font-semibold text-sm">Soccer</p>
+                <p className="text-xs text-muted-foreground">Log a session — time, field, notes</p>
+              </div>
+            </button>
+          </div>
+        </DrawerContent>
+      </Drawer>
+
+      {/* Soccer quick log */}
+      <Drawer open={soccerOpen} onOpenChange={setSoccerOpen}>
+        <DrawerContent>
+          <DrawerHeader>
+            <DrawerTitle>Log Soccer</DrawerTitle>
+          </DrawerHeader>
+          <div className="px-4 pb-8 space-y-3">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                inputMode="numeric"
+                placeholder="60"
+                value={soccerMinutes}
+                onChange={(e) => setSoccerMinutes(e.target.value)}
+                className="h-12 text-center text-lg font-mono flex-1"
+              />
+              <span className="text-sm text-muted-foreground shrink-0 w-24">minutes played</span>
+            </div>
+            <Input
+              placeholder="Field / location (optional)"
+              value={soccerField}
+              onChange={(e) => setSoccerField(e.target.value)}
+              className="h-12"
+            />
+            <Textarea
+              placeholder="Notes (optional)"
+              value={soccerNotes}
+              onChange={(e) => setSoccerNotes(e.target.value)}
+              rows={2}
+            />
+            <Button
+              onClick={saveSoccer}
+              disabled={savingSoccer || !soccerMinutes.trim()}
+              className="w-full h-12"
+            >
+              {savingSoccer ? "Saving..." : "Save"}
+            </Button>
           </div>
         </DrawerContent>
       </Drawer>

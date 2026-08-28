@@ -233,7 +233,7 @@ export default function InsightsPage() {
           supabase.from("exercise_pools").select("id, name"),
           supabase
             .from("run_sessions")
-            .select("name, started_at, duration_seconds, distance_meters")
+            .select("name, run_pool, started_at, duration_seconds, distance_meters")
             .not("duration_seconds", "is", null)
             .order("started_at", { ascending: false })
             .limit(150),
@@ -362,7 +362,10 @@ export default function InsightsPage() {
       const avgCutoff = new Date(now.getTime() - weeksForAvg * 7 * 86400000);
       const liftsInWindow = workouts.filter((w) => new Date(w.started_at) >= avgCutoff).length;
       const runsInWindow = runs.filter(
-        (r) => r.started_at && new Date(r.started_at) >= avgCutoff
+        (r) =>
+          r.started_at &&
+          new Date(r.started_at) >= avgCutoff &&
+          r.run_pool !== "soccer"
       ).length;
       const avgLiftsPerWeek = Math.round(liftsInWindow / weeksForAvg);
       const avgRunsPerWeek = Math.round(runsInWindow / weeksForAvg);
