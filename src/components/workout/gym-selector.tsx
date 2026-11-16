@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { Database } from "@/types/database.types";
+import { getCachedGyms, refreshGyms } from "@/lib/reference-data";
 import { Button } from "@/components/ui/button";
 import {
   Drawer,
@@ -27,17 +28,21 @@ export function GymSelector({ open, onOpenChange, onSelect }: GymSelectorProps) 
   const supabase = createClient();
 
   useEffect(() => {
-    if (open) {
-      supabase
-        .from("gyms")
-        .select("*")
-        .order("is_default", { ascending: false })
-        .order("name")
-        .then(({ data }) => {
-          setGyms(data || []);
-          setLoading(false);
-        });
-    }
+    if (!open) return;
+    let cancelled = false;
+    getCachedGyms().then((cached) => {
+      if (cancelled || !cached) return;
+      setGyms(cached);
+      setLoading(false);
+    });
+    refreshGyms(supabase).then((fresh) => {
+      if (cancelled) return;
+      if (fresh) setGyms(fresh);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [open, supabase]);
 
   return (

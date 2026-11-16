@@ -2,6 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { queueDelete, queueUpdate } from "@/lib/offline";
+import { putCachedRow, removeCachedRow } from "@/lib/reference-data";
 import { Database, TrackingMode, Equipment } from "@/types/database.types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -190,30 +192,25 @@ export function ExerciseDetail({
 
   async function handleUpdate() {
     setSaving(true);
-    const { data } = await supabase
-      .from("exercise_definitions")
-      .update({
-        name,
-        pool_id: poolId,
-        equipment: editEquipment,
-        supports_modes: editModes,
-        default_mode: editDefaultMode,
-        notes: notes || null,
-      })
-      .eq("id", exercise.id)
-      .select()
-      .single();
-
-    if (data) setExercise(data);
+    const patch = {
+      name,
+      pool_id: poolId,
+      equipment: editEquipment,
+      supports_modes: editModes,
+      default_mode: editDefaultMode,
+      notes: notes || null,
+    };
+    await queueUpdate("exercise_definitions", exercise.id, patch);
+    const updated = { ...exercise, ...patch };
+    await putCachedRow("exercises", updated);
+    setExercise(updated);
     setSaving(false);
     setEditOpen(false);
   }
 
   async function handleDelete() {
-    await supabase
-      .from("exercise_definitions")
-      .delete()
-      .eq("id", exercise.id);
+    await queueDelete("exercise_definitions", exercise.id);
+    await removeCachedRow("exercises", exercise.id);
     onBack();
   }
 

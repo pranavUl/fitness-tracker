@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useState, useRef, useEffect, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useWorkout } from "@/lib/hooks/use-workout";
 import { ExerciseCard } from "@/components/workout/exercise-card";
 import { ExercisePicker } from "@/components/workout/exercise-picker";
+import { SyncIndicator } from "@/components/sync-indicator";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -29,9 +30,10 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Plus, Timer, CheckCircle2, Pencil, X, ArrowLeft, WifiOff } from "lucide-react";
+import { Plus, Timer, CheckCircle2, Pencil, X, ArrowLeft } from "lucide-react";
 import { WorkoutExerciseState } from "@/lib/hooks/use-workout";
-import { TrackingMode, PrType } from "@/types/database.types";
+import { PrType } from "@/types/database.types";
+import { SetData } from "@/components/workout/set-row";
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -54,7 +56,7 @@ function SortableExercise({
   ex: WorkoutExerciseState;
   prs?: Record<string, PrType[]>;
   addSet: (weId: string) => void;
-  updateSet: (weId: string, set: any) => void;
+  updateSet: (weId: string, set: SetData) => void;
   completeSet: (weId: string, setId: string) => void;
   uncompleteSet: (weId: string, setId: string) => void;
   deleteSet: (weId: string, setId: string) => void;
@@ -96,10 +98,36 @@ function SortableExercise({
   );
 }
 
+function WorkoutSkeleton() {
+  return (
+    <div className="mx-auto max-w-lg px-4 pt-8">
+      <div className="space-y-4">
+        <div className="h-8 w-48 animate-pulse rounded-lg bg-muted" />
+        <div className="h-48 animate-pulse rounded-2xl bg-muted" />
+        <div className="h-48 animate-pulse rounded-2xl bg-muted" />
+      </div>
+    </div>
+  );
+}
+
+// The id rides in the query string so one cached copy of this page can
+// open any workout with no signal.
 export default function WorkoutPage() {
-  const params = useParams();
+  return (
+    <Suspense fallback={<WorkoutSkeleton />}>
+      <WorkoutView />
+    </Suspense>
+  );
+}
+
+function WorkoutView() {
+  const workoutId = useSearchParams().get("id");
+  // Fresh state per workout
+  return <WorkoutScreen key={workoutId ?? ""} workoutId={workoutId} />;
+}
+
+function WorkoutScreen({ workoutId }: { workoutId: string | null }) {
   const router = useRouter();
-  const workoutId = params.id as string;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [finishOpen, setFinishOpen] = useState(false);
   const [cancelOpen, setCancelOpen] = useState(false);
@@ -111,10 +139,9 @@ export default function WorkoutPage() {
     workout,
     exercises,
     loading,
+    unavailable,
     elapsed,
     prs,
-    isOffline,
-    pendingSync,
     addExercise,
     addSet,
     updateSet,
@@ -192,22 +219,16 @@ export default function WorkoutPage() {
     router.push("/");
   }
 
-  if (loading) {
-    return (
-      <div className="mx-auto max-w-lg px-4 pt-8">
-        <div className="space-y-4">
-          <div className="h-8 w-48 animate-pulse rounded-lg bg-muted" />
-          <div className="h-48 animate-pulse rounded-2xl bg-muted" />
-          <div className="h-48 animate-pulse rounded-2xl bg-muted" />
-        </div>
-      </div>
-    );
-  }
+  if (loading) return <WorkoutSkeleton />;
 
   if (!workout) {
     return (
       <div className="mx-auto max-w-lg px-4 pt-12 text-center">
-        <p className="text-muted-foreground">Workout not found</p>
+        <p className="text-muted-foreground">
+          {unavailable === "offline"
+            ? "This workout isn't saved on this phone yet. Open it once with signal and it'll be available offline."
+            : "Workout not found"}
+        </p>
         <Button variant="outline" onClick={() => router.push("/")} className="mt-4">
           Go Home
         </Button>
@@ -235,7 +256,7 @@ export default function WorkoutPage() {
   async function handleFinish() {
     await finishWorkout();
     setFinishOpen(false);
-    router.push(`/workout/${workoutId}/summary?finished=1`);
+    router.push(`/workout/summary?id=${workoutId}&finished=1`);
   }
 
   return (
@@ -308,15 +329,7 @@ export default function WorkoutPage() {
         </div>
       </div>
 
-      {/* Offline indicator */}
-      {(isOffline || pendingSync) && (
-        <div className="mt-2 flex items-center gap-2 rounded-lg bg-amber-500/10 border border-amber-500/20 px-3 py-2 text-xs text-amber-400">
-          <WifiOff className="h-3.5 w-3.5 shrink-0" />
-          {isOffline
-            ? "Offline — your workout is saved locally"
-            : "Syncing changes..."}
-        </div>
-      )}
+      <SyncIndicator className="mt-2" />
 
       {/* Exercises with drag-and-drop */}
       <DndContext

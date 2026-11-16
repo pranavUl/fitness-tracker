@@ -1,8 +1,24 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { createClient, getLocalUser } from "@/lib/supabase/client";
-import { kvGet, kvSet } from "@/lib/offline";
+import { createClient, getUserId } from "@/lib/supabase/client";
+import {
+  WorkoutRecord,
+  getActiveLocalWorkout,
+  hasUnsyncedChanges,
+  kvGet,
+  kvSet,
+  listWorkoutRecords,
+  loadCachedWorkout,
+  markWorkoutDeleted,
+  mergePendingRows,
+  queueDelete,
+  queueUpdate,
+  queueUpsert,
+  saveWorkoutLocal,
+} from "@/lib/offline";
+import { getCachedExercises, getCachedGyms, refreshLibrary } from "@/lib/reference-data";
+import { WorkoutExerciseState, setPrTypes } from "@/lib/workout-state";
 import { Database, TrackingMode, PrType } from "@/types/database.types";
 import { PR_BADGE_STYLES, PR_BADGE_LABELS } from "@/lib/pr-constants";
 import { cn } from "@/lib/utils";
@@ -42,6 +58,7 @@ interface WorkoutWithDetails extends Workout {
   total_volume: number;
   pr_count: number;
   exercises: {
+    exercise_id?: string;
     name: string;
     mode: TrackingMode;
     sets: {
@@ -121,6 +138,63 @@ function workoutToText(w: WorkoutWithDetails): string {
 
 type RunSession = Database["public"]["Tables"]["run_sessions"]["Row"];
 
+interface HistorySnapshot {
+  workouts: WorkoutWithDetails[];
+  runSessions: RunSession[];
+}
+
+// v2 adds exercise ids, which offline "repeat workout" needs
+const HISTORY_KEY = "history:v2";
+
+function toWorkoutRow(w: WorkoutWithDetails): Workout {
+  return {
+    id: w.id,
+    user_id: w.user_id,
+    gym_id: w.gym_id,
+    title: w.title,
+    started_at: w.started_at,
+    finished_at: w.finished_at,
+    notes: w.notes,
+    workout_type: w.workout_type,
+    created_at: w.created_at,
+  };
+}
+
+function recordToDetails(
+  r: WorkoutRecord,
+  gymName: (id: string | null) => string | null
+): WorkoutWithDetails {
+  let totalVolume = 0;
+  let prCount = 0;
+  const exercises = r.exercises.map((e) => ({
+    exercise_id: e.definition.id,
+    name: e.definition.name,
+    mode: e.workoutExercise.mode,
+    sets: e.sets.map((s) => {
+      const prs = (s.id && r.prs[s.id]) || [];
+      if (!s.is_warmup && s.weight && s.reps) totalVolume += s.weight * s.reps;
+      prCount += prs.length;
+      return {
+        set_number: s.set_number,
+        reps: s.reps,
+        weight: s.weight,
+        duration_seconds: s.duration_seconds,
+        is_warmup: s.is_warmup,
+        completed_at: s.completed_at,
+        note: s.note,
+        prs,
+      };
+    }),
+  }));
+  return {
+    ...r.workout,
+    gym_name: gymName(r.workout.gym_id),
+    total_volume: totalVolume,
+    pr_count: prCount,
+    exercises,
+  };
+}
+
 interface HistoryItem {
   id: string;
   type: "lift" | "run";
@@ -153,8 +227,43 @@ export default function HistoryPage() {
   const [runEditName, setRunEditName] = useState("");
   const [runDeleteOpen, setRunDeleteOpen] = useState(false);
   const networkLoadedRef = useRef(false);
+  const serverRef = useRef<HistorySnapshot>({ workouts: [], runSessions: [] });
+  const renderSeqRef = useRef(0);
   const supabase = createClient();
   const router = useRouter();
+
+  /** Server view plus everything saved on this phone that it may not have yet. */
+  const render = useCallback(async (snap: HistorySnapshot) => {
+    serverRef.current = snap;
+    const seq = ++renderSeqRef.current;
+    const [records, gyms, runs] = await Promise.all([
+      listWorkoutRecords(),
+      getCachedGyms(),
+      mergePendingRows("run_sessions", snap.runSessions),
+    ]);
+    // A newer paint (e.g. fresh network data) started while this one was reading
+    if (seq !== renderSeqRef.current) return;
+    const byId = new Map(records.map((r) => [r.workout.id, r]));
+    const gymName = (id: string | null) => gyms?.find((g) => g.id === id)?.name ?? null;
+    const unsynced = (r: WorkoutRecord) => !!r.workout.finished_at && hasUnsyncedChanges(r);
+    const local = records
+      .filter((r) => !r.deleted && unsynced(r))
+      .map((r) => recordToDetails(r, gymName));
+    setWorkouts(
+      [
+        ...snap.workouts.filter((w) => {
+          const r = byId.get(w.id);
+          return !r || (!r.deleted && !unsynced(r));
+        }),
+        ...local,
+      ].sort((a, b) => b.started_at.localeCompare(a.started_at))
+    );
+    setRunSessions(
+      runs
+        .filter((r) => r.duration_seconds != null)
+        .sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? ""))
+    );
+  }, []);
 
   const load = useCallback(async () => {
     let computedWorkouts: WorkoutWithDetails[] = [];
@@ -168,6 +277,8 @@ export default function HistoryPage() {
         .limit(50),
       supabase.from("gyms").select("*"),
     ]);
+    // Supabase reports "no signal" as an error, not an exception
+    if (workoutsRes.error || gymsRes.error) throw new Error("offline");
 
     const gymMap = new Map(
       (gymsRes.data || []).map((g) => [g.id, g.name])
@@ -177,11 +288,12 @@ export default function HistoryPage() {
 
     if (ws.length) {
       const workoutIds = ws.map((w) => w.id);
-      const { data: wes } = await supabase
+      const { data: wes, error: wesErr } = await supabase
         .from("workout_exercises")
         .select("*")
         .in("workout_id", workoutIds)
         .order("sort_order");
+      if (wesErr) throw new Error("offline");
 
       const weIds = (wes || []).map((we) => we.id);
       const exerciseIds = [
@@ -197,14 +309,16 @@ export default function HistoryPage() {
               .order("set_number")
           : Promise.resolve({
               data: [] as Database["public"]["Tables"]["sets"]["Row"][],
+              error: null,
             }),
         exerciseIds.length
           ? supabase
               .from("exercise_definitions")
               .select("id, name")
               .in("id", exerciseIds)
-          : Promise.resolve({ data: [] as { id: string; name: string }[] }),
+          : Promise.resolve({ data: [] as { id: string; name: string }[], error: null }),
       ]);
+      if (setsRes.error || defsRes.error) throw new Error("offline");
 
       const defMap = new Map(
         (defsRes.data || []).map((d) => [d.id, d.name])
@@ -232,26 +346,19 @@ export default function HistoryPage() {
 
       computedWorkouts = ws.map((w) => {
           const exs = (wesByWorkout.get(w.id) || []).map((we) => ({
+            exercise_id: we.exercise_id,
             name: defMap.get(we.exercise_id) || "Unknown",
             mode: we.mode,
-            sets: (setsByWe.get(we.id) || []).map((s) => {
-              const prs: PrType[] = [];
-              if (s.is_pr_weight) prs.push("WEIGHT");
-              if (s.is_pr_1rm) prs.push("1RM");
-              if (s.is_pr_volume) prs.push("VOL");
-              if (s.is_pr_reps) prs.push("REPS");
-              if (s.is_pr_duration) prs.push("DURATION");
-              return {
-                set_number: s.set_number,
-                reps: s.reps,
-                weight: s.weight,
-                duration_seconds: s.duration_seconds,
-                is_warmup: s.is_warmup,
-                completed_at: s.completed_at,
-                note: s.note,
-                prs,
-              };
-            }),
+            sets: (setsByWe.get(we.id) || []).map((s) => ({
+              set_number: s.set_number,
+              reps: s.reps,
+              weight: s.weight,
+              duration_seconds: s.duration_seconds,
+              is_warmup: s.is_warmup,
+              completed_at: s.completed_at,
+              note: s.note,
+              prs: setPrTypes(s),
+            })),
           }));
 
           let totalVolume = 0;
@@ -274,43 +381,48 @@ export default function HistoryPage() {
           };
         });
     }
-    setWorkouts(computedWorkouts);
 
     // Run sessions
-    const { data: runs } = await supabase
+    const { data: runs, error: runsErr } = await supabase
       .from("run_sessions")
       .select("*")
       .not("duration_seconds", "is", null)
       .order("started_at", { ascending: false })
       .limit(50);
-
-    setRunSessions(runs || []);
+    if (runsErr) throw new Error("offline");
 
     networkLoadedRef.current = true;
-    kvSet("history", { workouts: computedWorkouts, runSessions: runs || [] });
+    const snap = { workouts: computedWorkouts, runSessions: runs || [] };
+    kvSet(HISTORY_KEY, snap);
+    await render(snap);
     } catch {
-      // Offline — snapshot hydration has already painted what we have
+      // No signal — show the last snapshot plus whatever is saved on this phone
+      await render(serverRef.current);
     } finally {
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [render]);
 
   // Instant paint from the last snapshot
   useEffect(() => {
-    kvGet<{ workouts: WorkoutWithDetails[]; runSessions: RunSession[] }>(
-      "history"
-    ).then((snap) => {
+    kvGet<HistorySnapshot>(HISTORY_KEY).then(async (snap) => {
       if (!snap || networkLoadedRef.current) return;
-      setWorkouts(snap.workouts);
-      setRunSessions(snap.runSessions);
+      await render(snap);
       setLoading(false);
     });
-  }, []);
+  }, [render]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  /** Apply a local edit to the cached server view too, so it survives an offline reopen. */
+  async function patchHistory(fn: (s: HistorySnapshot) => HistorySnapshot) {
+    const next = fn(serverRef.current);
+    await kvSet(HISTORY_KEY, next);
+    await render(next);
+  }
 
   const allItems: HistoryItem[] = [
     ...workouts.map((w) => ({
@@ -349,40 +461,35 @@ export default function HistoryPage() {
 
   async function handleEditTitle() {
     if (!menuWorkout || !editTitle.trim()) return;
-    await supabase
-      .from("workouts")
-      .update({ title: editTitle.trim() })
-      .eq("id", menuWorkout.id);
+    const id = menuWorkout.id;
+    const title = editTitle.trim();
+    const rec = await loadCachedWorkout(id);
+    if (rec && !rec.deleted) {
+      // A copy on this phone would overwrite the server on its next sync — edit it too
+      await saveWorkoutLocal(
+        id,
+        { workout: { ...rec.workout, title }, exercises: rec.exercises, prs: rec.prs },
+        { dirty: true }
+      );
+    } else {
+      await queueUpdate("workouts", id, { title });
+    }
     setEditOpen(false);
     setMenuWorkout(null);
-    load();
+    await patchHistory((s) => ({
+      ...s,
+      workouts: s.workouts.map((w) => (w.id === id ? { ...w, title } : w)),
+    }));
   }
 
   async function handleDelete() {
     if (!menuWorkout) return;
-
-    await supabase.from("pr_snapshots").delete().eq("workout_id", menuWorkout.id);
-    await supabase.from("personal_records").delete().eq("workout_id", menuWorkout.id);
-
-    const { data: wes } = await supabase
-      .from("workout_exercises")
-      .select("id")
-      .eq("workout_id", menuWorkout.id);
-
-    if (wes?.length) {
-      const weIds = wes.map((we) => we.id);
-      await supabase.from("sets").delete().in("workout_exercise_id", weIds);
-      await supabase
-        .from("workout_exercises")
-        .delete()
-        .eq("workout_id", menuWorkout.id);
-    }
-
-    await supabase.from("workouts").delete().eq("id", menuWorkout.id);
-
+    const id = menuWorkout.id;
+    // Tombstone: the sync engine revokes its PRs and deletes it server-side
+    await markWorkoutDeleted(toWorkoutRow(menuWorkout));
     setDeleteConfirmOpen(false);
     setMenuWorkout(null);
-    load();
+    await patchHistory((s) => ({ ...s, workouts: s.workouts.filter((w) => w.id !== id) }));
   }
 
   async function handleExport() {
@@ -405,160 +512,139 @@ export default function HistoryPage() {
   function handleEdit() {
     if (!menuWorkout) return;
     setMenuWorkout(null);
-    router.push(`/workout/${menuWorkout.id}`);
+    router.push(`/workout?id=${menuWorkout.id}`);
   }
 
   async function handleRepeat() {
     if (!menuWorkout) return;
-
-    const { data: inProgress } = await supabase
-      .from("workouts")
-      .select("id")
-      .is("finished_at", null)
-      .limit(1);
-
-    if (inProgress?.length) {
-      setActiveWorkoutId(inProgress[0].id);
-      setMenuWorkout(menuWorkout);
+    const active = await getActiveLocalWorkout();
+    if (active) {
+      setActiveWorkoutId(active.id);
       setConflictOpen(true);
       return;
     }
-
     await doRepeat();
   }
 
   async function doRepeat() {
     if (!menuWorkout) return;
-    const user = await getLocalUser(supabase);
-    if (!user) return;
+    const source = menuWorkout;
+    const userId = await getUserId(supabase);
+    if (!userId) return;
 
-    const { data: newWorkout } = await supabase
-      .from("workouts")
-      .insert({
-        user_id: user.id,
-        gym_id: menuWorkout.gym_id,
-        title: menuWorkout.title,
-        started_at: new Date().toISOString(),
-        workout_type: menuWorkout.workout_type,
-      })
-      .select()
-      .single();
+    let defs = await getCachedExercises();
+    const missing = source.exercises.some(
+      (ex) => ex.exercise_id && !defs?.some((d) => d.id === ex.exercise_id)
+    );
+    if (!defs || missing) defs = (await refreshLibrary(supabase))?.exercises ?? defs ?? [];
+    const defMap = new Map(defs.map((d) => [d.id, d]));
 
-    if (!newWorkout) return;
+    // Built on the phone — works with zero signal, syncs later
+    const workoutId = crypto.randomUUID();
+    const startedAt = new Date().toISOString();
+    const workout: Workout = {
+      id: workoutId,
+      user_id: userId,
+      gym_id: source.gym_id,
+      title: source.title,
+      started_at: startedAt,
+      finished_at: null,
+      notes: null,
+      workout_type: source.workout_type,
+      created_at: startedAt,
+    };
+    const exercises: WorkoutExerciseState[] = source.exercises
+      .filter((ex) => ex.exercise_id && defMap.has(ex.exercise_id))
+      .map((ex, i) => ({
+        workoutExercise: {
+          id: crypto.randomUUID(),
+          user_id: userId,
+          workout_id: workoutId,
+          exercise_id: ex.exercise_id!,
+          sort_order: i,
+          mode: ex.mode,
+          is_warmup_group: false,
+          notes: null,
+          started_at: null,
+          created_at: startedAt,
+        },
+        definition: defMap.get(ex.exercise_id!)!,
+        sets: ex.sets.map((s) => ({
+          id: crypto.randomUUID(),
+          set_number: s.set_number,
+          reps: s.reps,
+          weight: s.weight,
+          duration_seconds: s.duration_seconds,
+          is_warmup: s.is_warmup,
+          note: s.note,
+          completed_at: null,
+        })),
+        previous: null,
+      }));
 
-    const { data: sourceWes } = await supabase
-      .from("workout_exercises")
-      .select("*")
-      .eq("workout_id", menuWorkout.id)
-      .order("sort_order");
-
-    if (sourceWes?.length) {
-      for (const srcWe of sourceWes) {
-        const { data: newWe } = await supabase
-          .from("workout_exercises")
-          .insert({
-            user_id: user.id,
-            workout_id: newWorkout.id,
-            exercise_id: srcWe.exercise_id,
-            sort_order: srcWe.sort_order,
-            mode: srcWe.mode,
-          })
-          .select()
-          .single();
-
-        if (!newWe) continue;
-
-        const { data: srcSets } = await supabase
-          .from("sets")
-          .select("*")
-          .eq("workout_exercise_id", srcWe.id)
-          .order("set_number");
-
-        if (srcSets?.length) {
-          await supabase.from("sets").insert(
-            srcSets.map((s) => ({
-              user_id: user.id,
-              workout_exercise_id: newWe.id,
-              set_number: s.set_number,
-              reps: s.reps,
-              weight: s.weight,
-              duration_seconds: s.duration_seconds,
-              is_warmup: s.is_warmup,
-              note: s.note,
-            }))
-          );
-        }
-      }
-    }
+    await saveWorkoutLocal(workoutId, { workout, exercises, prs: {} }, { dirty: true });
+    try { localStorage.setItem("active_workout_id", workoutId); } catch {}
 
     setMenuWorkout(null);
     setConflictOpen(false);
-    router.push(`/workout/${newWorkout.id}`);
+    router.push(`/workout?id=${workoutId}`);
   }
 
   async function handleDiscardAndRepeat() {
     if (!activeWorkoutId) return;
-
-    await supabase.from("pr_snapshots").delete().eq("workout_id", activeWorkoutId);
-    await supabase.from("personal_records").delete().eq("workout_id", activeWorkoutId);
-
-    const { data: wes } = await supabase
-      .from("workout_exercises")
-      .select("id")
-      .eq("workout_id", activeWorkoutId);
-
-    if (wes?.length) {
-      const weIds = wes.map((we) => we.id);
-      await supabase.from("sets").delete().in("workout_exercise_id", weIds);
-      await supabase.from("workout_exercises").delete().in("id", weIds);
-    }
-    await supabase.from("workouts").delete().eq("id", activeWorkoutId);
+    const rec = await loadCachedWorkout(activeWorkoutId);
+    if (rec) await markWorkoutDeleted(rec.workout);
+    try { localStorage.removeItem("active_workout_id"); } catch {}
     setActiveWorkoutId(null);
-
     await doRepeat();
   }
 
   async function handleRunEditName() {
     if (!menuRun || !runEditName.trim()) return;
-    await supabase.from("run_sessions").update({ name: runEditName.trim() }).eq("id", menuRun.id);
+    const id = menuRun.id;
+    const name = runEditName.trim();
+    await queueUpdate("run_sessions", id, { name });
     setRunEditOpen(false);
     setMenuRun(null);
-    load();
+    await patchHistory((s) => ({
+      ...s,
+      runSessions: s.runSessions.map((r) => (r.id === id ? { ...r, name } : r)),
+    }));
   }
 
   async function handleRunDelete() {
     if (!menuRun) return;
-    await supabase.from("run_sessions").delete().eq("id", menuRun.id);
+    const id = menuRun.id;
+    await queueDelete("run_sessions", id);
     setRunDeleteOpen(false);
     setMenuRun(null);
-    load();
+    await patchHistory((s) => ({ ...s, runSessions: s.runSessions.filter((r) => r.id !== id) }));
   }
 
   async function handleRunRepeat() {
     if (!menuRun) return;
-    const user = await getLocalUser(supabase);
-    if (!user) return;
+    const userId = await getUserId(supabase);
+    if (!userId) return;
 
     const rawData = menuRun.raw_data as Record<string, unknown> | null;
-    const { data: session } = await supabase
-      .from("run_sessions")
-      .insert({
-        user_id: user.id,
-        source: "manual",
-        name: menuRun.name,
-        run_pool: menuRun.run_pool,
-        run_workout: menuRun.run_workout,
-        started_at: new Date().toISOString(),
-        completed: false,
-        raw_data: {
-          templateId: rawData?.templateId || menuRun.run_workout,
-          ...(rawData?.variantId ? { variantId: rawData.variantId } : {}),
-        },
-      })
-      .select().single();
+    const id = crypto.randomUUID();
+    await queueUpsert("run_sessions", {
+      id,
+      user_id: userId,
+      source: "manual",
+      name: menuRun.name,
+      run_pool: menuRun.run_pool,
+      run_workout: menuRun.run_workout,
+      started_at: new Date().toISOString(),
+      completed: false,
+      raw_data: {
+        templateId: rawData?.templateId || menuRun.run_workout,
+        ...(rawData?.variantId ? { variantId: rawData.variantId } : {}),
+      },
+    });
 
     setMenuRun(null);
-    if (session) router.push(`/run/${session.id}`);
+    router.push(`/run?id=${id}`);
   }
 
   function handleRunExport() {
@@ -638,8 +724,8 @@ export default function HistoryPage() {
                         key={item.id}
                         role="button"
                         tabIndex={0}
-                        onClick={() => router.push(`/run/${r.id}`)}
-                        onKeyDown={(e) => e.key === "Enter" && router.push(`/run/${r.id}`)}
+                        onClick={() => router.push(`/run?id=${r.id}`)}
+                        onKeyDown={(e) => e.key === "Enter" && router.push(`/run?id=${r.id}`)}
                         className="rounded-2xl border border-border bg-card p-4 text-left transition-colors hover:bg-accent active:scale-[0.99] cursor-pointer"
                       >
                         <div className="flex items-start justify-between">
@@ -692,9 +778,9 @@ export default function HistoryPage() {
                       key={item.id}
                       role="button"
                       tabIndex={0}
-                      onClick={() => router.push(`/workout/${w.id}/summary`)}
+                      onClick={() => router.push(`/workout/summary?id=${w.id}`)}
                       onKeyDown={(e) =>
-                        e.key === "Enter" && router.push(`/workout/${w.id}/summary`)
+                        e.key === "Enter" && router.push(`/workout/summary?id=${w.id}`)
                       }
                       className="rounded-2xl border border-border bg-card p-4 text-left transition-colors hover:bg-accent active:scale-[0.99] cursor-pointer"
                     >
@@ -900,7 +986,7 @@ export default function HistoryPage() {
           </DrawerHeader>
           <div className="px-4 space-y-1 pb-4">
             <button
-              onClick={() => { if (menuRun) router.push(`/run/${menuRun.id}`); setMenuRun(null); }}
+              onClick={() => { if (menuRun) router.push(`/run?id=${menuRun.id}`); setMenuRun(null); }}
               className="flex w-full items-center gap-3 rounded-xl p-3 text-left hover:bg-accent transition-colors"
             >
               <SquarePen className="h-4 w-4 text-muted-foreground" />
@@ -1002,7 +1088,7 @@ export default function HistoryPage() {
               onClick={() => {
                 setConflictOpen(false);
                 setMenuWorkout(null);
-                router.push(`/workout/${activeWorkoutId}`);
+                router.push(`/workout?id=${activeWorkoutId}`);
               }}
               variant="outline"
               className="h-12"

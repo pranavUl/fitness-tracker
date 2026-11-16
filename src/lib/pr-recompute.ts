@@ -2,6 +2,7 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import { Database, Equipment, PrType } from "@/types/database.types";
 import { getEquipmentScope } from "./pr-detection";
 import { PR_FLAG_MAP } from "./pr-constants";
+import { softCheck } from "./sync-errors";
 
 type SetsUpdate = Database["public"]["Tables"]["sets"]["Update"];
 
@@ -27,17 +28,28 @@ export async function revokeAndRecomputePRs(params: {
 
   // 1. Revoke: remove snapshots and current-best records owned by these sets.
   //    Must happen before the sets themselves are deleted (FK is SET NULL).
-  const { error: snapDelErr } = await supabase
-    .from("pr_snapshots")
-    .delete()
-    .in("set_id", removedSetIds);
-  if (snapDelErr) console.error("[PR] snapshot revoke failed:", snapDelErr.message);
-
-  const { error: recDelErr } = await supabase
-    .from("personal_records")
-    .delete()
-    .in("set_id", removedSetIds);
-  if (recDelErr) console.error("[PR] record revoke failed:", recDelErr.message);
+  softCheck(
+    await supabase.from("pr_snapshots").delete().in("set_id", removedSetIds),
+    "[PR] snapshot revoke"
+  );
+  softCheck(
+    await supabase.from("personal_records").delete().in("set_id", removedSetIds),
+    "[PR] record revoke"
+  );
+  // Sets that still exist (unchecked or edited) lose their badges too
+  softCheck(
+    await supabase
+      .from("sets")
+      .update({
+        is_pr_weight: false,
+        is_pr_1rm: false,
+        is_pr_volume: false,
+        is_pr_reps: false,
+        is_pr_duration: false,
+      })
+      .in("id", removedSetIds),
+    "[PR] clear revoked flags"
+  );
 
   // 2. Gather remaining history for this exercise at this scope.
   let query = supabase
@@ -49,11 +61,9 @@ export async function revokeAndRecomputePRs(params: {
     .not("set_id", "is", null);
   if (scope === "per_gym" && gymId) query = query.eq("gym_id", gymId);
 
-  const { data: snaps, error: snapErr } = await query;
-  if (snapErr) {
-    console.error("[PR] snapshot query failed:", snapErr.message);
-    return {};
-  }
+  const snapRes = await query;
+  if (!softCheck(snapRes, "[PR] snapshot query")) return {};
+  const snaps = snapRes.data;
 
   // 3. Best remaining snapshot per pr_type (highest value; latest on tie).
   type Snap = NonNullable<typeof snaps>[number];
@@ -81,10 +91,12 @@ export async function revokeAndRecomputePRs(params: {
       .eq("pr_scope", scope);
     if (scope === "per_gym" && gymId) recQuery = recQuery.eq("gym_id", gymId);
 
-    const { data: existing } = await recQuery.limit(1);
+    const existingRes = await recQuery.limit(1);
+    if (!softCheck(existingRes, "[PR] record lookup")) continue;
+    const existing = existingRes.data;
     if (existing && existing.length > 0) continue; // record survived, nothing to do
 
-    const { error: insErr } = await supabase.from("personal_records").insert({
+    const insRes = await supabase.from("personal_records").insert({
       user_id: userId,
       exercise_id: exerciseId,
       pr_type: snap.pr_type,
@@ -99,17 +111,17 @@ export async function revokeAndRecomputePRs(params: {
       achieved_at: snap.achieved_at,
       context_json: snap.context_json,
     });
-    if (insErr) {
-      console.error("[PR] record restore failed:", insErr.message);
-      continue;
-    }
+    if (!softCheck(insRes, "[PR] record restore")) continue;
 
     // Re-flag the set that owns the restored record.
     if (snap.set_id) {
       const flag = PR_FLAG_MAP[prType as PrType];
       const update: SetsUpdate = {};
       (update as Record<string, boolean>)[flag] = true;
-      await supabase.from("sets").update(update).eq("id", snap.set_id);
+      softCheck(
+        await supabase.from("sets").update(update).eq("id", snap.set_id),
+        "[PR] re-flag restored set"
+      );
       (restored[snap.set_id] ||= []).push(prType as PrType);
     }
   }

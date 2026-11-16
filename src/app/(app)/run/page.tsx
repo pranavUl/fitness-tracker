@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useState, useEffect, useRef, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { Database } from "@/types/database.types";
+import { getPendingRow, kvGet, kvSet, queueUpdate } from "@/lib/offline";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -28,14 +29,67 @@ const POOL_ICON: Record<string, { Icon: typeof Zap; color: string; bg: string }>
   threshold: { Icon: Gauge, color: "text-amber-400", bg: "bg-amber-500/20" },
 };
 
+function withDefaults(row: Partial<RunSession> & { id: string }): RunSession {
+  return {
+    user_id: "",
+    strava_id: null,
+    source: "manual",
+    name: null,
+    run_pool: null,
+    run_workout: null,
+    distance_meters: null,
+    duration_seconds: null,
+    avg_pace: null,
+    avg_heart_rate: null,
+    completed: false,
+    notes: null,
+    started_at: null,
+    polyline: null,
+    raw_data: null,
+    synced_at: new Date().toISOString(),
+    ...row,
+  };
+}
+
+/**
+ * Save a run edit on the phone (merged with any unsynced create/edit) and
+ * return the updated row for display.
+ */
+async function saveRunLocal(
+  session: RunSession,
+  patch: Partial<RunSession>
+): Promise<RunSession> {
+  await queueUpdate("run_sessions", session.id, patch);
+  const updated = { ...session, ...patch };
+  await kvSet(`run:${session.id}`, updated);
+  return updated;
+}
+
+function RunSkeleton() {
+  return (
+    <div className="mx-auto max-w-lg px-4 pt-12">
+      <div className="h-8 w-48 animate-pulse rounded-lg bg-muted mx-auto" />
+    </div>
+  );
+}
+
+// The id rides in the query string so one cached copy of this page works offline
 export default function RunSessionPage() {
-  const params = useParams();
+  return (
+    <Suspense fallback={<RunSkeleton />}>
+      <RunSessionView />
+    </Suspense>
+  );
+}
+
+function RunSessionView() {
   const router = useRouter();
-  const sessionId = params.id as string;
+  const sessionId = useSearchParams().get("id") ?? "";
   const supabase = createClient();
 
   const [session, setSession] = useState<RunSession | null>(null);
   const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [notes, setNotes] = useState("");
   const [splits, setSplits] = useState<Record<string, string>>({});
@@ -44,14 +98,38 @@ export default function RunSessionPage() {
 
   useEffect(() => {
     async function load() {
-      const { data: sess } = await supabase
-        .from("run_sessions")
-        .select("*")
-        .eq("id", sessionId)
-        .single();
+      if (!sessionId) {
+        router.push("/");
+        return;
+      }
+      // Phone first: a run started offline only exists in the outbox
+      const [cached, pending] = await Promise.all([
+        kvGet<RunSession>(`run:${sessionId}`),
+        getPendingRow("run_sessions", sessionId),
+      ]);
+      let sess: RunSession | null =
+        cached || pending
+          ? withDefaults({ ...cached, ...pending, id: sessionId } as RunSession)
+          : null;
+
+      if (!pending) {
+        const { data, error } = await supabase
+          .from("run_sessions")
+          .select("*")
+          .eq("id", sessionId)
+          .maybeSingle();
+        if (data) {
+          sess = data;
+          kvSet(`run:${sessionId}`, data);
+        } else if (!error && !sess) {
+          router.push("/");
+          return;
+        }
+      }
 
       if (!sess) {
-        router.push("/");
+        setUnavailable(true);
+        setLoading(false);
         return;
       }
 
@@ -129,9 +207,8 @@ export default function RunSessionPage() {
 
     const tier = computeTier();
 
-    await supabase
-      .from("run_sessions")
-      .update({
+    if (session) {
+      await saveRunLocal(session, {
         completed,
         duration_seconds: duration,
         notes: notes || null,
@@ -140,16 +217,23 @@ export default function RunSessionPage() {
           splits,
           ...(tier ? { tier: tier.label, tierPool: tier.pool } : {}),
         },
-      })
-      .eq("id", sessionId);
+      });
+    }
 
     router.push("/");
   }
 
-  if (loading) {
+  if (loading) return <RunSkeleton />;
+
+  if (unavailable) {
     return (
-      <div className="mx-auto max-w-lg px-4 pt-12">
-        <div className="h-8 w-48 animate-pulse rounded-lg bg-muted mx-auto" />
+      <div className="mx-auto max-w-lg px-4 pt-12 text-center">
+        <p className="text-muted-foreground">
+          This run isn&apos;t saved on this phone yet. Open it once with signal and it&apos;ll be available offline.
+        </p>
+        <Button variant="outline" onClick={() => router.push("/")} className="mt-4">
+          Go Home
+        </Button>
       </div>
     );
   }
@@ -165,7 +249,6 @@ export default function RunSessionPage() {
         variantId={variantId}
         template={template}
         intervals={intervals}
-        supabase={supabase}
         onUpdate={(updated) => setSession(updated)}
       />
     );
@@ -329,7 +412,6 @@ function FinishedRunView({
   variantId,
   template,
   intervals,
-  supabase,
   onUpdate,
 }: {
   session: RunSession;
@@ -338,7 +420,6 @@ function FinishedRunView({
   variantId: string;
   template: RunTemplate | undefined;
   intervals: IntervalInput[];
-  supabase: ReturnType<typeof createClient>;
   onUpdate: (s: RunSession) => void;
 }) {
   const router = useRouter();
@@ -373,24 +454,19 @@ function FinishedRunView({
     const parsedDuration = parseDurationInput(editDuration);
     const tier = computeEditTier();
 
-    const { data: updated } = await supabase
-      .from("run_sessions")
-      .update({
-        duration_seconds: parsedDuration ?? session.duration_seconds,
-        notes: editNotes || null,
-        raw_data: {
-          ...(rawData || {}),
-          splits: editSplits,
-          ...(tier ? { tier: tier.label, tierPool: tier.pool } : {}),
-        },
-      })
-      .eq("id", session.id)
-      .select()
-      .single();
+    const updated = await saveRunLocal(session, {
+      duration_seconds: parsedDuration ?? session.duration_seconds,
+      notes: editNotes || null,
+      raw_data: {
+        ...(rawData || {}),
+        splits: editSplits,
+        ...(tier ? { tier: tier.label, tierPool: tier.pool } : {}),
+      },
+    });
 
     setSaving(false);
     setEditing(false);
-    if (updated) onUpdate(updated);
+    onUpdate(updated);
   }
 
   return (

@@ -1,16 +1,14 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { Equipment, PrType } from "@/types/database.types";
+import { Equipment } from "@/types/database.types";
 import { getEquipmentScope } from "@/lib/pr-detection";
-import { kvGet, kvSet } from "@/lib/offline";
+import { kvGet, kvSet, listOutbox } from "@/lib/offline";
 import { cn } from "@/lib/utils";
 import {
   LineChart,
   Line,
-  BarChart,
-  Bar,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -22,16 +20,15 @@ import {
   Dumbbell,
   Weight,
   Flame,
-  Trophy,
+  Wheat,
   Zap,
-  Layers,
-  Sparkles,
 } from "lucide-react";
 
 // Entity colors — validated for dark surface (lightness band, CVD, contrast)
 const COLOR_LIFT = "#059669";
 const COLOR_WEIGHT = "#3b82f6";
 const COLOR_PROTEIN = "#ea580c";
+const COLOR_CARBS = "#d97706";
 const GYM_COLORS = [COLOR_LIFT, COLOR_WEIGHT, COLOR_PROTEIN, "#a855f7"];
 
 const GRID_STROKE = "rgba(255,255,255,0.06)";
@@ -45,17 +42,10 @@ const TOOLTIP_STYLE = {
 
 const ALL_GYMS = "All gyms";
 
-type Unit = "lb" | "reps" | "s";
-
 interface DayCell {
   date: string;
   score: number; // completed working sets that day; -1 = no training
   items: string[];
-}
-
-interface VolumePoint {
-  label: string;
-  volume: number;
 }
 
 type StrengthRow = { label: string; iso: string; [key: string]: string | number | null };
@@ -66,40 +56,12 @@ interface StrengthExercise {
   rows: StrengthRow[];
 }
 
-interface StrongLift {
-  exerciseName: string;
-  value: number;
-  unit: Unit;
-  kind: string; // "e1RM" | "hold" | "volume" | ""
-  set: string | null;
-  sortValue: number;
-  trendPct: number | null;
-}
-
-interface Spotlight {
-  exerciseName: string;
-  metric: string;
-  previous: number;
-  value: number;
-  unit: Unit;
-  pct: number;
-}
-
-interface SplitBar {
-  pool: string;
-  sets: number;
-}
-
-interface TrendPoint {
-  label: string;
-  value: number;
-}
-
-interface WeightPoint {
-  label: string;
-  iso: string;
-  value: number;
-  trend: number;
+/** One logged day from daily_tracking. */
+interface DailyEntry {
+  date: string; // YYYY-MM-DD
+  protein: number | null;
+  carbs: number | null;
+  weight: number | null;
 }
 
 interface InsightsSnapshot {
@@ -107,15 +69,9 @@ interface InsightsSnapshot {
   setsThisWeek: number;
   avgLiftsPerWeek: number;
   avgRunsPerWeek: number;
-  spotlight: Spotlight | null;
   heatmap: DayCell[];
   strength: StrengthExercise[];
-  strongLifts: StrongLift[];
-  split: SplitBar[];
-  volumePoints: VolumePoint[];
-  weightData: WeightPoint[];
-  weightRate: number | null; // lb per week, from the trend line
-  proteinData: TrendPoint[];
+  daily: DailyEntry[];
 }
 
 const EMPTY: InsightsSnapshot = {
@@ -123,16 +79,14 @@ const EMPTY: InsightsSnapshot = {
   setsThisWeek: 0,
   avgLiftsPerWeek: 0,
   avgRunsPerWeek: 0,
-  spotlight: null,
   heatmap: [],
   strength: [],
-  strongLifts: [],
-  split: [],
-  volumePoints: [],
-  weightData: [],
-  weightRate: null,
-  proteinData: [],
+  daily: [],
 };
+
+// v8: dropped strongest lifts / spotlight / split / volume, added raw daily entries
+const SNAPSHOT_KEY = "insights:v8";
+const DAILY_DAYS = 90;
 
 function dateKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -145,47 +99,6 @@ function shortLabel(iso: string): string {
   });
 }
 
-interface SetContext {
-  weight?: number | null;
-  reps?: number | null;
-  duration_seconds?: number | null;
-  display_value?: number;
-  display_previous?: number;
-}
-
-function setString(ctx: SetContext | null): string | null {
-  if (!ctx) return null;
-  if (ctx.weight && ctx.reps) return `${ctx.weight} × ${ctx.reps}`;
-  if (ctx.weight && ctx.duration_seconds) return `${ctx.weight} lb · ${ctx.duration_seconds}s`;
-  if (ctx.duration_seconds) return `${ctx.duration_seconds}s`;
-  if (ctx.reps) return `${ctx.reps} reps`;
-  return null;
-}
-
-function metricInfo(type: PrType): { label: string; unit: Unit } {
-  switch (type) {
-    case "1RM":
-      return { label: "e1RM", unit: "lb" };
-    case "WEIGHT":
-      return { label: "Top weight", unit: "lb" };
-    case "VOL":
-      return { label: "Volume", unit: "lb" };
-    case "REPS":
-      return { label: "Reps", unit: "reps" };
-    case "DURATION":
-      return { label: "Hold", unit: "s" };
-  }
-}
-
-function fmtVal(value: number, unit: Unit): string {
-  if (unit === "lb") return `${value.toLocaleString()} lb`;
-  if (unit === "reps") return `${value} reps`;
-  return `${value}s`;
-}
-
-// Headline priority — never lead with VOL unless it's the only record.
-const TYPE_ORDER: PrType[] = ["1RM", "WEIGHT", "REPS", "DURATION", "VOL"];
-
 // Deeper green = more sets. Pale mint (few) → rich emerald (many).
 function heatFill(score: number, max: number): string {
   if (score < 0) return "rgba(255,255,255,0.05)";
@@ -197,27 +110,102 @@ function heatFill(score: number, max: number): string {
   return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
 }
 
+type BodyMetric = "protein" | "carbs" | "weight";
+
+const BODY_METRICS: Record<
+  BodyMetric,
+  { label: string; unit: string; color: string; Icon: typeof Flame }
+> = {
+  protein: { label: "Protein", unit: "g", color: COLOR_PROTEIN, Icon: Flame },
+  carbs: { label: "Carbs", unit: "g", color: COLOR_CARBS, Icon: Wheat },
+  weight: { label: "Weight", unit: "lb", color: COLOR_WEIGHT, Icon: Weight },
+};
+
+const RANGES = [
+  { days: 7, label: "1W" },
+  { days: 14, label: "2W" },
+  { days: 30, label: "1M" },
+  { days: 90, label: "3M" },
+] as const;
+
+interface BodyRow {
+  iso: string;
+  label: string;
+  value: number | null;
+  trend: number | null;
+}
+
+function isoNoon(iso: string): Date {
+  return new Date(iso + "T12:00:00");
+}
+
+/**
+ * Gap-aware exponential moving average of scale weight: smooths daily
+ * water/sodium noise into a "true weight" line. Keyed by date.
+ */
+function weightTrend(daily: DailyEntry[]): Map<string, number> {
+  const out = new Map<string, number>();
+  let prev: number | null = null;
+  let prevDate: Date | null = null;
+  for (const d of daily) {
+    if (d.weight == null) continue;
+    const date = isoNoon(d.date);
+    let trend: number;
+    if (prev == null || prevDate == null) {
+      trend = d.weight;
+    } else {
+      const gapDays = Math.max(1, (date.getTime() - prevDate.getTime()) / 86400000);
+      trend = prev + (1 - Math.pow(0.85, gapDays)) * (d.weight - prev);
+    }
+    prev = trend;
+    prevDate = date;
+    out.set(d.date, Math.round(trend * 10) / 10);
+  }
+  return out;
+}
+
+/** Unsynced Home edits (e.g. logged offline or seconds ago) win over the server copy. */
+async function withPendingDaily(daily: DailyEntry[]): Promise<DailyEntry[]> {
+  const pending = (await listOutbox()).filter(
+    (e) => e.table === "daily_tracking" && e.op !== "delete" && e.row?.date
+  );
+  if (pending.length === 0) return daily;
+  const byDate = new Map(daily.map((d) => [d.date, { ...d }]));
+  for (const e of pending) {
+    const row = e.row!;
+    const date = row.date as string;
+    const cur = byDate.get(date) ?? { date, protein: null, carbs: null, weight: null };
+    if ("protein_grams" in row) cur.protein = (row.protein_grams as number | null) ?? null;
+    if ("carbs_grams" in row) cur.carbs = (row.carbs_grams as number | null) ?? null;
+    if ("morning_weight" in row) cur.weight = (row.morning_weight as number | null) ?? null;
+    byDate.set(date, cur);
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 export default function InsightsPage() {
   const [data, setData] = useState<InsightsSnapshot>(EMPTY);
   const [loading, setLoading] = useState(true);
   const [selectedExercise, setSelectedExercise] = useState<string | null>(null);
   const [selectedGym, setSelectedGym] = useState<string>(ALL_GYMS);
   const [selectedDay, setSelectedDay] = useState<DayCell | null>(null);
+  const [bodyMetric, setBodyMetric] = useState<BodyMetric>("protein");
+  const [bodyRange, setBodyRange] = useState<number>(7);
   const networkLoadedRef = useRef(false);
   const supabase = createClient();
 
   const load = useCallback(async () => {
     try {
       const now = new Date();
-      const sixtyDaysAgo = new Date(now);
-      sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+      const dailyStart = new Date(now);
+      dailyStart.setDate(dailyStart.getDate() - DAILY_DAYS);
 
-      const [trackingRes, workoutsRes, recordsRes, gymsRes, poolsRes, runsRes] =
+      const [trackingRes, workoutsRes, gymsRes, runsRes] =
         await Promise.all([
           supabase
             .from("daily_tracking")
-            .select("*")
-            .gte("date", dateKey(sixtyDaysAgo))
+            .select("date, protein_grams, carbs_grams, morning_weight")
+            .gte("date", dateKey(dailyStart))
             .order("date"),
           supabase
             .from("workouts")
@@ -225,12 +213,7 @@ export default function InsightsPage() {
             .not("finished_at", "is", null)
             .order("started_at", { ascending: false })
             .limit(150),
-          supabase
-            .from("personal_records")
-            .select("*")
-            .order("achieved_at", { ascending: false }),
           supabase.from("gyms").select("id, name"),
-          supabase.from("exercise_pools").select("id, name"),
           supabase
             .from("run_sessions")
             .select("name, run_pool, started_at, duration_seconds, distance_meters")
@@ -239,11 +222,15 @@ export default function InsightsPage() {
             .limit(150),
         ]);
 
+      // Supabase reports "no signal" as an error, not an exception — bail
+      // out before an empty result overwrites the cached snapshot
+      if ([trackingRes, workoutsRes, gymsRes, runsRes].some((r) => r.error)) {
+        throw new Error("offline");
+      }
+
       const workouts = workoutsRes.data || [];
-      const records = recordsRes.data || [];
       const runs = runsRes.data || [];
       const gymMap = new Map((gymsRes.data || []).map((g) => [g.id, g.name]));
-      const poolMap = new Map((poolsRes.data || []).map((p) => [p.id, p.name]));
 
       const workoutDate = new Map(workouts.map((w) => [w.id, w.started_at]));
       const gymByWorkout = new Map(
@@ -252,39 +239,36 @@ export default function InsightsPage() {
 
       // ---- Sets + exercises ----
       const workoutIds = workouts.map((w) => w.id);
-      const { data: wes } = workoutIds.length
+      const { data: wes, error: wesErr } = workoutIds.length
         ? await supabase
             .from("workout_exercises")
             .select("id, workout_id, exercise_id")
             .in("workout_id", workoutIds)
-        : { data: [] };
+        : { data: [], error: null };
+      if (wesErr) throw new Error("offline");
 
       const weIds = (wes || []).map((we) => we.id);
-      const { data: allSets } = weIds.length
+      const { data: allSets, error: setsErr } = weIds.length
         ? await supabase
             .from("sets")
-            .select("workout_exercise_id, weight, reps, e1rm, is_warmup, completed_at")
+            .select("workout_exercise_id, weight, reps, e1rm, is_warmup")
             .in("workout_exercise_id", weIds)
             .not("completed_at", "is", null)
-        : { data: [] };
+        : { data: [], error: null };
+      if (setsErr) throw new Error("offline");
 
-      const exerciseIds = [
-        ...new Set([
-          ...(wes || []).map((we) => we.exercise_id),
-          ...records.map((r) => r.exercise_id),
-        ]),
-      ];
-      const { data: defs } = exerciseIds.length
+      const exerciseIds = [...new Set((wes || []).map((we) => we.exercise_id))];
+      const { data: defs, error: defsErr } = exerciseIds.length
         ? await supabase
             .from("exercise_definitions")
-            .select("id, name, equipment, pool_id")
+            .select("id, name, equipment")
             .in("id", exerciseIds)
-        : { data: [] };
+        : { data: [], error: null };
+      if (defsErr) throw new Error("offline");
       const nameMap = new Map((defs || []).map((d) => [d.id, d.name]));
       const equipMap = new Map<string, Equipment | null>(
         (defs || []).map((d) => [d.id, d.equipment])
       );
-      const poolByExercise = new Map((defs || []).map((d) => [d.id, d.pool_id]));
 
       // ---- Aggregate sets ----
       const weMeta = new Map(
@@ -293,32 +277,15 @@ export default function InsightsPage() {
           { workoutId: we.workout_id, exerciseId: we.exercise_id },
         ])
       );
-      const volumeByWorkout = new Map<string, number>();
       const setsByWorkout = new Map<string, number>();
       type BestSet = { e1rm: number; weight: number | null; reps: number | null };
       const e1rmByExercise = new Map<string, Map<string, BestSet>>();
-
-      const cutoff28 = new Date(now);
-      cutoff28.setDate(cutoff28.getDate() - 28);
-      const setsByPool = new Map<string, number>();
 
       for (const s of allSets || []) {
         const meta = weMeta.get(s.workout_exercise_id);
         if (!meta) continue;
         if (!s.is_warmup) {
           setsByWorkout.set(meta.workoutId, (setsByWorkout.get(meta.workoutId) || 0) + 1);
-          const iso = workoutDate.get(meta.workoutId);
-          if (iso && new Date(iso) >= cutoff28) {
-            const poolId = poolByExercise.get(meta.exerciseId);
-            const poolName = poolId ? poolMap.get(poolId) || "Other" : "Other";
-            setsByPool.set(poolName, (setsByPool.get(poolName) || 0) + 1);
-          }
-        }
-        if (!s.is_warmup && s.weight && s.reps) {
-          volumeByWorkout.set(
-            meta.workoutId,
-            (volumeByWorkout.get(meta.workoutId) || 0) + s.weight * s.reps
-          );
         }
         if (s.e1rm && !s.is_warmup) {
           let byWorkout = e1rmByExercise.get(meta.exerciseId);
@@ -370,72 +337,6 @@ export default function InsightsPage() {
       const avgLiftsPerWeek = Math.round(liftsInWindow / weeksForAvg);
       const avgRunsPerWeek = Math.round(runsInWindow / weeksForAvg);
 
-      // ---- PR Spotlight: standout improvement, biased toward core lifts ----
-      // A raw %-jump favors brand-new or light accessory lifts (fast early
-      // gains). Instead, score = % improvement × importance, where importance
-      // rewards lifts you train often and compound free-weight movements.
-      const sessionsByExercise = new Map<string, Set<string>>();
-      for (const we of wes || []) {
-        const set = sessionsByExercise.get(we.exercise_id) ?? new Set<string>();
-        set.add(we.workout_id);
-        sessionsByExercise.set(we.exercise_id, set);
-      }
-      const equipWeight = (eq: Equipment | null): number => {
-        switch (eq) {
-          case "barbell":
-            return 1.4;
-          case "dumbbell":
-            return 1.2;
-          case "bodyweight":
-            return 1.15;
-          case "kettlebell":
-            return 1.1;
-          case "smith_machine":
-            return 1.05;
-          default:
-            return 1.0;
-        }
-      };
-      const spotCutoff = new Date(now);
-      spotCutoff.setDate(spotCutoff.getDate() - 30);
-      let spotlight: Spotlight | null = null;
-      let spotScore = -1;
-      let spotFallback: Spotlight | null = null;
-      let spotFallbackScore = -1;
-      for (const r of records) {
-        if (new Date(r.achieved_at) < spotCutoff) continue;
-        const ctx = r.context_json as SetContext | null;
-        const value = ctx?.display_value ?? r.value;
-        const previous = ctx?.display_previous ?? r.previous_value;
-        if (previous == null || previous <= 0) continue;
-        const pct = ((value - previous) / previous) * 100;
-        if (pct <= 0) continue;
-        const sessions = sessionsByExercise.get(r.exercise_id)?.size ?? 1;
-        const importance =
-          Math.min(sessions, 12) * equipWeight(equipMap.get(r.exercise_id) ?? null);
-        const score = pct * importance;
-        const info = metricInfo(r.pr_type as PrType);
-        const candidate: Spotlight = {
-          exerciseName: nameMap.get(r.exercise_id) || "Unknown",
-          metric: info.label,
-          previous: Math.round(previous),
-          value: Math.round(value),
-          unit: info.unit,
-          pct,
-        };
-        // Prefer established lifts (>= 3 sessions); fall back if none qualify
-        if (sessions >= 3) {
-          if (score > spotScore) {
-            spotScore = score;
-            spotlight = candidate;
-          }
-        } else if (score > spotFallbackScore) {
-          spotFallbackScore = score;
-          spotFallback = candidate;
-        }
-      }
-      if (!spotlight) spotlight = spotFallback;
-
       // ---- Heatmap: last 16 weeks (lifts + runs), intensity = working sets ----
       const heatmap: DayCell[] = [];
       const heatStart = new Date(weekStart);
@@ -476,8 +377,6 @@ export default function InsightsPage() {
 
       // ---- Strength progression (per exercise, split by gym for machines) ----
       const strength: StrengthExercise[] = [];
-      const trendByExercise = new Map<string, number | null>();
-      const bestE1rmByExercise = new Map<string, number>();
 
       for (const [exId, byWorkout] of e1rmByExercise) {
         const name = nameMap.get(exId);
@@ -491,21 +390,6 @@ export default function InsightsPage() {
           }))
           .filter((p) => p.iso)
           .sort((a, b) => a.iso.localeCompare(b.iso));
-
-        bestE1rmByExercise.set(exId, Math.max(...pts.map((p) => p.best.e1rm)));
-        if (pts.length >= 2) {
-          const latest = pts[pts.length - 1];
-          const cutoff = new Date(latest.iso);
-          cutoff.setDate(cutoff.getDate() - 28);
-          let baseline = pts[0];
-          for (const p of pts) if (new Date(p.iso) <= cutoff) baseline = p;
-          trendByExercise.set(
-            exId,
-            baseline.iso !== latest.iso && baseline.best.e1rm > 0
-              ? ((latest.best.e1rm - baseline.best.e1rm) / baseline.best.e1rm) * 100
-              : null
-          );
-        }
 
         const byGym = new Map<string, typeof pts>();
         for (const p of pts) {
@@ -537,139 +421,27 @@ export default function InsightsPage() {
       }
       strength.sort((a, b) => b.rows.length - a.rows.length);
 
-      // ---- Strongest lifts (one headline per exercise, VOL never leads) ----
-      const recordsByExercise = new Map<string, typeof records>();
-      for (const r of records) {
-        const arr = recordsByExercise.get(r.exercise_id) || [];
-        arr.push(r);
-        recordsByExercise.set(r.exercise_id, arr);
-      }
-      const strongLifts: StrongLift[] = [];
-      for (const [exId, recs] of recordsByExercise) {
-        const name = nameMap.get(exId) || "Unknown";
-        const bestByType = new Map<PrType, { value: number; ctx: SetContext | null }>();
-        for (const r of recs) {
-          const t = r.pr_type as PrType;
-          const ctx = r.context_json as SetContext | null;
-          const v = ctx?.display_value ?? r.value;
-          const cur = bestByType.get(t);
-          if (!cur || v > cur.value) bestByType.set(t, { value: v, ctx });
-        }
-        const headlineType = TYPE_ORDER.find((t) => bestByType.has(t));
-        if (!headlineType) continue;
-        const h = bestByType.get(headlineType)!;
-        const info = metricInfo(headlineType);
-        const e1 = bestE1rmByExercise.get(exId);
-        const showSet =
-          headlineType === "1RM" || headlineType === "WEIGHT" || headlineType === "VOL";
-        strongLifts.push({
-          exerciseName: name,
-          value: Math.round(h.value),
-          unit: info.unit,
-          kind:
-            headlineType === "1RM"
-              ? "e1RM"
-              : headlineType === "DURATION"
-                ? "hold"
-                : headlineType === "VOL"
-                  ? "volume"
-                  : "",
-          set: showSet ? setString(h.ctx) : null,
-          sortValue: e1 ?? 0,
-          trendPct: trendByExercise.get(exId) ?? null,
-        });
-      }
-      strongLifts.sort((a, b) => b.sortValue - a.sortValue || b.value - a.value);
-      const topLifts = strongLifts.slice(0, 10);
-
-      // ---- Training split (last 28 days) ----
-      const split = [...setsByPool.entries()]
-        .map(([p, sets]) => ({ pool: p, sets }))
-        .sort((a, b) => b.sets - a.sets);
-
-      // ---- Volume per workout ----
-      const volumePoints: VolumePoint[] = workouts
-        .slice(0, 15)
-        .reverse()
-        .map((w) => ({ label: shortLabel(w.started_at), volume: volumeByWorkout.get(w.id) || 0 }));
-
-      // ---- Body weight + protein ----
-      // Trend = gap-aware exponential moving average over logged entries,
-      // smoothing out daily water/sodium noise into a "true weight" line.
-      const weightData: WeightPoint[] = [];
-      const proteinData: TrendPoint[] = [];
-      let emaPrev: number | null = null;
-      let emaPrevDate: Date | null = null;
-      for (const t of trackingRes.data || []) {
-        const label = new Date(t.date + "T12:00:00").toLocaleDateString("en-US", {
-          month: "short",
-          day: "numeric",
-        });
-        if (t.morning_weight) {
-          const d = new Date(t.date + "T12:00:00");
-          let trend: number;
-          if (emaPrev == null || emaPrevDate == null) {
-            trend = t.morning_weight;
-          } else {
-            const gapDays = Math.max(
-              1,
-              (d.getTime() - emaPrevDate.getTime()) / 86400000
-            );
-            const alpha = 1 - Math.pow(0.85, gapDays);
-            trend = emaPrev + alpha * (t.morning_weight - emaPrev);
-          }
-          emaPrev = trend;
-          emaPrevDate = d;
-          weightData.push({
-            label,
-            iso: t.date,
-            value: t.morning_weight,
-            trend: Math.round(trend * 10) / 10,
-          });
-        }
-        if (t.protein_grams) proteinData.push({ label, value: t.protein_grams });
-      }
-
-      // Weekly rate of change from the trend line (needs >= 5 days of span)
-      let weightRate: number | null = null;
-      if (weightData.length >= 2) {
-        const last = weightData[weightData.length - 1];
-        const lastDate = new Date(last.iso + "T12:00:00");
-        // baseline: the entry closest to 14 days before the latest
-        let baseline = weightData[0];
-        for (const p of weightData) {
-          const days =
-            (lastDate.getTime() - new Date(p.iso + "T12:00:00").getTime()) / 86400000;
-          if (days >= 14) baseline = p;
-        }
-        const spanDays =
-          (lastDate.getTime() - new Date(baseline.iso + "T12:00:00").getTime()) /
-          86400000;
-        if (spanDays >= 5) {
-          weightRate =
-            Math.round(((last.trend - baseline.trend) / spanDays) * 7 * 10) / 10;
-        }
-      }
+      // ---- Body & nutrition: raw daily entries, charted client-side ----
+      const daily: DailyEntry[] = (trackingRes.data || []).map((t) => ({
+        date: t.date,
+        protein: t.protein_grams,
+        carbs: t.carbs_grams,
+        weight: t.morning_weight,
+      }));
 
       const snapshot: InsightsSnapshot = {
         sessionsThisWeek,
         setsThisWeek,
         avgLiftsPerWeek,
         avgRunsPerWeek,
-        spotlight,
         heatmap,
         strength,
-        strongLifts: topLifts,
-        split,
-        volumePoints,
-        weightData,
-        weightRate,
-        proteinData: proteinData.slice(-14),
+        daily,
       };
 
-      setData(snapshot);
       networkLoadedRef.current = true;
-      kvSet("insights:v7", snapshot);
+      kvSet(SNAPSHOT_KEY, snapshot);
+      setData({ ...snapshot, daily: await withPendingDaily(daily) });
     } catch {
       // Offline — snapshot hydration has already painted what we have
     } finally {
@@ -679,10 +451,14 @@ export default function InsightsPage() {
   }, []);
 
   useEffect(() => {
-    kvGet<InsightsSnapshot>("insights:v7").then((snap) => {
-      if (!snap || networkLoadedRef.current) return;
-      setData(snap);
-      setLoading(false);
+    kvGet<InsightsSnapshot>(SNAPSHOT_KEY).then(async (snap) => {
+      if (networkLoadedRef.current) return;
+      // Even with no snapshot, show anything logged on this phone
+      const base = snap ?? EMPTY;
+      const daily = await withPendingDaily(base.daily);
+      if (networkLoadedRef.current) return;
+      setData({ ...base, daily });
+      if (snap || daily.length > 0) setLoading(false);
     });
   }, []);
 
@@ -702,7 +478,47 @@ export default function InsightsPage() {
     1,
     ...data.heatmap.filter((c) => c.score > 0).map((c) => c.score)
   );
-  const maxSplit = Math.max(1, ...data.split.map((s) => s.sets));
+
+  const body = useMemo(() => {
+    const trend = weightTrend(data.daily);
+    const byDate = new Map(data.daily.map((d) => [d.date, d]));
+    const today = new Date();
+    const rows: BodyRow[] = [];
+    for (let i = bodyRange - 1; i >= 0; i--) {
+      const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+      const iso = dateKey(d);
+      const entry = byDate.get(iso);
+      rows.push({
+        iso,
+        label: d.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+        value: entry ? entry[bodyMetric] : null,
+        trend: bodyMetric === "weight" ? (trend.get(iso) ?? null) : null,
+      });
+    }
+    const logged = rows.filter((r) => r.value != null);
+    const todayValue = rows[rows.length - 1].value;
+    const last7 = rows.slice(-7).filter((r) => r.value != null);
+    const avg7 = last7.length
+      ? Math.round(last7.reduce((a, r) => a + r.value!, 0) / last7.length)
+      : null;
+
+    // Weight: latest trend + weekly rate over up to the last 14 days
+    let latestTrend: number | null = null;
+    let ratePerWeek: number | null = null;
+    const trendPts = [...trend.entries()];
+    if (trendPts.length) {
+      const [lastIso, lastTrend] = trendPts[trendPts.length - 1];
+      latestTrend = lastTrend;
+      const lastDate = isoNoon(lastIso);
+      let base = trendPts[0];
+      for (const p of trendPts) {
+        if ((lastDate.getTime() - isoNoon(p[0]).getTime()) / 86400000 >= 14) base = p;
+      }
+      const span = (lastDate.getTime() - isoNoon(base[0]).getTime()) / 86400000;
+      if (span >= 5) ratePerWeek = Math.round(((lastTrend - base[1]) / span) * 7 * 10) / 10;
+    }
+    return { rows, logged: logged.length, todayValue, avg7, latestTrend, ratePerWeek };
+  }, [data.daily, bodyMetric, bodyRange]);
 
   if (loading) {
     return (
@@ -722,8 +538,9 @@ export default function InsightsPage() {
 
   const hasAnything =
     data.heatmap.some((c) => c.score >= 0) ||
-    data.strongLifts.length > 0 ||
-    data.weightData.length > 0;
+    data.strength.length > 0 ||
+    data.daily.length > 0;
+  const metric = BODY_METRICS[bodyMetric];
 
   return (
     <div className="mx-auto max-w-lg px-4 pt-6 pb-24">
@@ -761,7 +578,7 @@ export default function InsightsPage() {
         <div className="rounded-2xl border border-dashed border-border p-8 text-center mb-4">
           <TrendingUp className="mx-auto h-8 w-8 text-muted-foreground" />
           <p className="mt-2 text-sm text-muted-foreground">
-            Charts appear as you log workouts, weight, and protein.
+            Charts appear as you log workouts, protein, carbs, and weight.
           </p>
         </div>
       )}
@@ -942,163 +759,105 @@ export default function InsightsPage() {
         </div>
       )}
 
-      {/* Strongest lifts */}
-      {data.strongLifts.length > 0 && (
-        <div className="rounded-2xl border border-border bg-card p-4 mb-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Trophy className="h-4 w-4 text-amber-400" />
-            <h2 className="text-sm font-semibold">Strongest Lifts</h2>
-          </div>
-          <div className="divide-y divide-border/60">
-            {data.strongLifts.map((lift) => (
-              <div key={lift.exerciseName} className="flex items-center gap-3 py-2 first:pt-0 last:pb-0">
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm truncate">{lift.exerciseName}</p>
-                  {lift.set && (
-                    <p className="text-[11px] text-muted-foreground tabular-nums">{lift.set}</p>
-                  )}
-                </div>
-                {lift.trendPct != null && Math.abs(lift.trendPct) >= 1 && (
-                  <span
-                    className={cn(
-                      "text-[11px] font-medium tabular-nums shrink-0",
-                      lift.trendPct > 0 ? "text-emerald-400" : "text-red-400"
-                    )}
-                  >
-                    {lift.trendPct > 0 ? "↑" : "↓"}
-                    {Math.abs(Math.round(lift.trendPct))}%
-                  </span>
+      {/* Body & nutrition */}
+      <div className="rounded-2xl border border-border bg-card p-4 mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          <metric.Icon className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-sm font-semibold">Body &amp; Nutrition</h2>
+          <div className="ml-auto flex rounded-lg bg-muted/40 border border-border p-0.5">
+            {RANGES.map((r) => (
+              <button
+                key={r.days}
+                onClick={() => setBodyRange(r.days)}
+                className={cn(
+                  "px-2 py-0.5 text-[11px] rounded-md tabular-nums",
+                  bodyRange === r.days
+                    ? "bg-background text-foreground"
+                    : "text-muted-foreground"
                 )}
-                <div className="text-right shrink-0 w-20">
-                  <p className="text-sm font-semibold tabular-nums">
-                    {fmtVal(lift.value, lift.unit)}
-                  </p>
-                  {lift.kind && (
-                    <p className="text-[10px] text-muted-foreground">{lift.kind}</p>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          <p className="mt-2.5 text-[10px] text-muted-foreground/60">
-            ↑↓ vs 28 days ago · sorted by estimated 1RM
-          </p>
-        </div>
-      )}
-
-      {/* PR Spotlight */}
-      {data.spotlight && (
-        <div className="rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 to-transparent p-4 mb-4">
-          <div className="flex items-center gap-1.5 mb-2">
-            <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
-            <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
-              PR Spotlight
-            </p>
-            <span className="ml-auto text-[10px] text-muted-foreground">last 30 days</span>
-          </div>
-          <div className="flex items-end justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-base font-bold truncate">{data.spotlight.exerciseName}</p>
-              <p className="text-xs text-muted-foreground tabular-nums mt-0.5">
-                {data.spotlight.metric} {fmtVal(data.spotlight.previous, data.spotlight.unit)} →{" "}
-                {fmtVal(data.spotlight.value, data.spotlight.unit)}
-              </p>
-            </div>
-            <p className="text-2xl font-bold text-emerald-400 tabular-nums shrink-0">
-              +{Math.round(data.spotlight.pct)}%
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Training split */}
-      {data.split.length > 0 && (
-        <div className="rounded-2xl border border-border bg-card p-4 mb-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Layers className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">Training Split</h2>
-            <span className="text-[10px] text-muted-foreground ml-auto">last 28 days</span>
-          </div>
-          <div className="space-y-2">
-            {data.split.map((s) => (
-              <div key={s.pool} className="flex items-center gap-2">
-                <span className="text-xs w-20 shrink-0 truncate">{s.pool}</span>
-                <div className="flex-1 h-4 rounded bg-muted/40 overflow-hidden">
-                  <div
-                    className="h-full rounded"
-                    style={{ width: `${(s.sets / maxSplit) * 100}%`, backgroundColor: COLOR_LIFT }}
-                  />
-                </div>
-                <span className="text-xs tabular-nums text-muted-foreground w-10 text-right shrink-0">
-                  {s.sets}
-                </span>
-              </div>
+              >
+                {r.label}
+              </button>
             ))}
           </div>
         </div>
-      )}
 
-      {/* Volume per workout */}
-      {data.volumePoints.length > 1 && (
-        <div className="rounded-2xl border border-border bg-card p-4 mb-4">
-          <div className="flex items-center gap-2 mb-3">
-            <TrendingUp className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">Volume per Workout</h2>
-          </div>
-          <ResponsiveContainer width="100%" height={160}>
-            <BarChart data={data.volumePoints} barCategoryGap={2}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} vertical={false} />
-              <XAxis
-                dataKey="label"
-                tick={TICK_STYLE}
-                tickLine={false}
-                axisLine={false}
-                interval="preserveStartEnd"
-              />
-              <YAxis
-                tick={TICK_STYLE}
-                tickLine={false}
-                axisLine={false}
-                width={32}
-                tickFormatter={(v) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : `${v}`)}
-              />
-              <Tooltip
-                contentStyle={TOOLTIP_STYLE}
-                formatter={(value) => [`${Number(value).toLocaleString()} lb`, "Volume"]}
-              />
-              <Bar dataKey="volume" fill={COLOR_LIFT} radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
+        <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted/40 border border-border p-0.5 mb-3">
+          {(Object.keys(BODY_METRICS) as BodyMetric[]).map((m) => (
+            <button
+              key={m}
+              onClick={() => setBodyMetric(m)}
+              className={cn(
+                "h-8 rounded-md text-sm transition-colors",
+                bodyMetric === m ? "bg-background font-medium" : "text-muted-foreground"
+              )}
+            >
+              {BODY_METRICS[m].label}
+            </button>
+          ))}
         </div>
-      )}
 
-      {/* Body weight */}
-      {data.weightData.length > 1 && (
-        <div className="rounded-2xl border border-border bg-card p-4 mb-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Weight className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">Body Weight</h2>
-            <span className="ml-auto text-xs text-muted-foreground tabular-nums">
-              {data.weightData[data.weightData.length - 1].trend} lb
-              {data.weightRate != null && (
-                <span
+        {/* Headline numbers */}
+        <div className="grid grid-cols-2 gap-2 mb-3">
+          {bodyMetric === "weight" ? (
+            <>
+              <div className="rounded-lg bg-muted/30 px-3 py-2">
+                <p className="text-lg font-bold tabular-nums">
+                  {body.latestTrend != null ? `${body.latestTrend} lb` : "—"}
+                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                  Trend weight
+                </p>
+              </div>
+              <div className="rounded-lg bg-muted/30 px-3 py-2">
+                <p
                   className={cn(
-                    "ml-1.5",
-                    data.weightRate > 0
-                      ? "text-emerald-400"
-                      : data.weightRate < 0
-                        ? "text-red-400"
-                        : ""
+                    "text-lg font-bold tabular-nums",
+                    body.ratePerWeek != null && body.ratePerWeek > 0 && "text-emerald-400",
+                    body.ratePerWeek != null && body.ratePerWeek < 0 && "text-red-400"
                   )}
                 >
-                  {data.weightRate > 0 ? "+" : ""}
-                  {data.weightRate}/wk
-                </span>
-              )}
-            </span>
+                  {body.ratePerWeek != null
+                    ? `${body.ratePerWeek > 0 ? "+" : ""}${body.ratePerWeek} lb`
+                    : "—"}
+                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                  Per week
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="rounded-lg bg-muted/30 px-3 py-2">
+                <p className="text-lg font-bold tabular-nums">
+                  {body.todayValue != null ? `${body.todayValue}${metric.unit}` : "—"}
+                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                  Today
+                </p>
+              </div>
+              <div className="rounded-lg bg-muted/30 px-3 py-2">
+                <p className="text-lg font-bold tabular-nums">
+                  {body.avg7 != null ? `${body.avg7}${metric.unit}` : "—"}
+                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
+                  7-day avg
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+
+        {body.logged === 0 ? (
+          <div className="h-[170px] flex items-center justify-center rounded-lg border border-dashed border-border">
+            <p className="text-xs text-muted-foreground text-center px-6">
+              No {metric.label.toLowerCase()} logged in this range yet. Add it on Home and
+              it shows up here right away.
+            </p>
           </div>
-          <ResponsiveContainer width="100%" height={150}>
-            <LineChart data={data.weightData}>
+        ) : (
+          <ResponsiveContainer width="100%" height={170}>
+            <LineChart data={body.rows}>
               <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} vertical={false} />
               <XAxis
                 dataKey="label"
@@ -1106,89 +865,98 @@ export default function InsightsPage() {
                 tickLine={false}
                 axisLine={false}
                 interval="preserveStartEnd"
+                minTickGap={28}
               />
               <YAxis
-                domain={["dataMin - 2", "dataMax + 2"]}
+                domain={
+                  bodyMetric === "weight"
+                    ? ["dataMin - 2", "dataMax + 2"]
+                    : [
+                        (min: number) => Math.max(0, Math.floor((min * 0.85) / 10) * 10),
+                        (max: number) => Math.ceil((max * 1.1) / 10) * 10,
+                      ]
+                }
                 tick={TICK_STYLE}
                 tickLine={false}
                 axisLine={false}
-                width={32}
+                width={36}
+                allowDecimals={false}
               />
               <Tooltip
                 content={({ active, payload }) => {
                   if (!active || !payload?.length) return null;
-                  const p = payload[0].payload as WeightPoint;
+                  const row = payload[0].payload as BodyRow;
+                  if (row.value == null && row.trend == null) return null;
                   return (
                     <div style={TOOLTIP_STYLE} className="px-3 py-2 space-y-0.5">
-                      <p className="text-[10px] text-muted-foreground">{p.label}</p>
-                      <p className="text-sm font-semibold">trend {p.trend} lb</p>
-                      <p className="text-xs text-muted-foreground">scale {p.value} lb</p>
+                      <p className="text-[10px] text-muted-foreground">{row.label}</p>
+                      {bodyMetric === "weight" ? (
+                        <>
+                          {row.trend != null && (
+                            <p className="text-sm font-semibold" style={{ color: metric.color }}>
+                              trend {row.trend} lb
+                            </p>
+                          )}
+                          {row.value != null && (
+                            <p className="text-xs text-muted-foreground">scale {row.value} lb</p>
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-sm font-semibold" style={{ color: metric.color }}>
+                          {row.value}
+                          {metric.unit} {metric.label.toLowerCase()}
+                        </p>
+                      )}
                     </div>
                   );
                 }}
               />
-              <Line
-                type="monotone"
-                dataKey="value"
-                stroke="rgba(59,130,246,0.35)"
-                strokeWidth={1.5}
-                dot={{ r: 2, fill: "rgba(59,130,246,0.35)", strokeWidth: 0 }}
-                activeDot={{ r: 4 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="trend"
-                stroke={COLOR_WEIGHT}
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
+              {bodyMetric === "weight" ? (
+                <>
+                  <Line
+                    type="monotone"
+                    dataKey="value"
+                    stroke="rgba(59,130,246,0.35)"
+                    strokeWidth={1.5}
+                    dot={{ r: 2, fill: "rgba(59,130,246,0.35)", strokeWidth: 0 }}
+                    activeDot={{ r: 4 }}
+                    connectNulls
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="trend"
+                    stroke={COLOR_WEIGHT}
+                    strokeWidth={2}
+                    dot={false}
+                    activeDot={{ r: 5 }}
+                    connectNulls
+                    isAnimationActive={false}
+                  />
+                </>
+              ) : (
+                <Line
+                  type="linear"
+                  dataKey="value"
+                  stroke={metric.color}
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: metric.color, strokeWidth: 0 }}
+                  activeDot={{ r: 6 }}
+                  connectNulls
+                  isAnimationActive={false}
+                />
+              )}
             </LineChart>
           </ResponsiveContainer>
-          <div className="flex gap-x-3 mt-2">
-            <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: COLOR_WEIGHT }} />
-              Trend
-            </span>
-            <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span
-                className="h-2 w-2 rounded-full"
-                style={{ backgroundColor: "rgba(59,130,246,0.35)" }}
-              />
-              Scale weight
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Protein */}
-      {data.proteinData.length > 1 && (
-        <div className="rounded-2xl border border-border bg-card p-4 mb-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Flame className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">Protein</h2>
-            <span className="ml-auto text-xs text-muted-foreground">last 14 days</span>
-          </div>
-          <ResponsiveContainer width="100%" height={130}>
-            <BarChart data={data.proteinData} barCategoryGap={2}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} vertical={false} />
-              <XAxis
-                dataKey="label"
-                tick={TICK_STYLE}
-                tickLine={false}
-                axisLine={false}
-                interval="preserveStartEnd"
-              />
-              <YAxis tick={TICK_STYLE} tickLine={false} axisLine={false} width={32} />
-              <Tooltip
-                contentStyle={TOOLTIP_STYLE}
-                formatter={(value) => [`${value}g`, "Protein"]}
-              />
-              <Bar dataKey="value" fill={COLOR_PROTEIN} radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
+        )}
+        {body.logged > 0 && (
+          <p className="mt-2 text-[10px] text-muted-foreground/60">
+            {bodyMetric === "weight"
+              ? "Faint line = scale weight, bold = smoothed trend."
+              : `Logged ${body.logged} of ${bodyRange} days. Tap a point for details.`}
+          </p>
+        )}
+      </div>
     </div>
   );
 }

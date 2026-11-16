@@ -303,6 +303,7 @@ export interface Database {
           user_id: string;
           date: string;
           protein_grams: number | null;
+          carbs_grams: number | null;
           morning_weight: number | null;
           journal: string | null;
           created_at: string;
@@ -313,6 +314,7 @@ export interface Database {
           user_id: string;
           date: string;
           protein_grams?: number | null;
+          carbs_grams?: number | null;
           morning_weight?: number | null;
           journal?: string | null;
           created_at?: string;
@@ -323,6 +325,7 @@ export interface Database {
           user_id?: string;
           date?: string;
           protein_grams?: number | null;
+          carbs_grams?: number | null;
           morning_weight?: number | null;
           journal?: string | null;
           created_at?: string;

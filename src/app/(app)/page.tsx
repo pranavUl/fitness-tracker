@@ -2,11 +2,23 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { createClient, getLocalUser } from "@/lib/supabase/client";
+import { createClient, getUserId } from "@/lib/supabase/client";
 import { Database } from "@/types/database.types";
 import { GymSelector } from "@/components/workout/gym-selector";
 import { Input } from "@/components/ui/input";
-import { kvGet, kvSet } from "@/lib/offline";
+import { SyncIndicator } from "@/components/sync-indicator";
+import { DailyTracker } from "@/components/daily-tracker";
+import {
+  WorkoutRecord,
+  getActiveLocalWorkout,
+  kvGet,
+  kvSet,
+  listWorkoutRecords,
+  mergePendingRows,
+  queueUpsert,
+  saveWorkoutLocal,
+} from "@/lib/offline";
+import { getCachedGyms } from "@/lib/reference-data";
 import {
   Dumbbell,
   Play,
@@ -14,7 +26,6 @@ import {
   Timer,
   Weight,
   Check,
-  Flame,
   Zap,
   Footprints,
   Gauge,
@@ -63,14 +74,48 @@ interface TodayWorkout {
   total_volume: number;
 }
 
+/** What the server said last time (cached per day); local changes are layered on top. */
 interface HomeSnapshot {
   activeWorkout: Workout | null;
   todayWorkouts: TodayWorkout[];
   todayRuns: RunSession[];
-  protein: number | null;
-  weight: number | null;
-  trackingId: string | null;
   calendar: CalendarState;
+}
+
+type HomeBase = Omit<HomeSnapshot, "calendar">;
+
+const EMPTY_BASE: HomeBase = {
+  activeWorkout: null,
+  todayWorkouts: [],
+  todayRuns: [],
+};
+
+function dayKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function summarizeRecord(
+  r: WorkoutRecord,
+  gymName: (id: string | null) => string | null
+): TodayWorkout {
+  let setCount = 0;
+  let volume = 0;
+  for (const ex of r.exercises) {
+    for (const s of ex.sets) {
+      setCount++;
+      if (!s.is_warmup && s.weight && s.reps) volume += s.weight * s.reps;
+    }
+  }
+  return {
+    id: r.workout.id,
+    title: r.workout.title,
+    gym_name: gymName(r.workout.gym_id),
+    started_at: r.workout.started_at,
+    finished_at: r.workout.finished_at,
+    exercise_count: r.exercises.length,
+    set_count: setCount,
+    total_volume: volume,
+  };
 }
 
 function formatDuration(start: string, end: string): string {
@@ -104,15 +149,13 @@ export default function HomePage() {
   const [todayRuns, setTodayRuns] = useState<RunSession[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [protein, setProtein] = useState<number | null>(null);
-  const [weight, setWeight] = useState<number | null>(null);
-  const [trackingId, setTrackingId] = useState<string | null>(null);
-  const [savingProtein, setSavingProtein] = useState(false);
-  const [savingWeight, setSavingWeight] = useState(false);
+  const [, setDayTick] = useState(0);
   const [calendar, setCalendar] = useState<CalendarState>({ events: [], connected: false, calendarSelected: false, missedYesterday: [] });
   const [calendarPickerOpen, setCalendarPickerOpen] = useState(false);
   const [availableCalendars, setAvailableCalendars] = useState<{ id: string; name: string; color?: string }[]>([]);
   const networkLoadedRef = useRef(false);
+  const baseRef = useRef<HomeBase>(EMPTY_BASE);
+  const renderSeqRef = useRef(0);
   const calendarRef = useRef(calendar);
   useEffect(() => { calendarRef.current = calendar; }, [calendar]);
 
@@ -120,19 +163,86 @@ export default function HomePage() {
   const router = useRouter();
 
   const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const today = dayKey(now);
   const yesterdayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  const yesterday = `${yesterdayDate.getFullYear()}-${String(yesterdayDate.getMonth() + 1).padStart(2, "0")}-${String(yesterdayDate.getDate()).padStart(2, "0")}`;
+  const yesterday = dayKey(yesterdayDate);
+
+  // Each day's numbers live in their own row, so a new day starts blank.
+  // Roll over at midnight (and when reopened the next morning) even if the
+  // app stayed open, so nothing shows or saves into yesterday.
+  useEffect(() => {
+    const rollover = () => {
+      if (dayKey(new Date()) === today) return;
+      baseRef.current = EMPTY_BASE;
+      networkLoadedRef.current = false;
+      setDayTick((t) => t + 1);
+    };
+    const t = new Date();
+    const msToMidnight =
+      new Date(t.getFullYear(), t.getMonth(), t.getDate() + 1).getTime() - t.getTime();
+    const timer = setTimeout(rollover, msToMidnight + 1000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") rollover();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", rollover);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", rollover);
+    };
+  }, [today]);
+
+  /** Paint the server's view with everything saved on this phone layered on top. */
+  const render = useCallback(async (base: HomeBase) => {
+    baseRef.current = base;
+    const seq = ++renderSeqRef.current;
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const isToday = (iso: string | null) => {
+      const t = iso ? new Date(iso).getTime() : NaN;
+      return t >= dayStart && t < dayStart + 24 * 60 * 60 * 1000;
+    };
+    const [records, gyms, localActive, runs] = await Promise.all([
+      listWorkoutRecords(),
+      getCachedGyms(),
+      getActiveLocalWorkout(),
+      mergePendingRows("run_sessions", base.todayRuns),
+    ]);
+    // A newer paint (e.g. fresh network data) started while this one was
+    // reading, or midnight passed and this is yesterday's data
+    if (seq !== renderSeqRef.current || dayKey(new Date()) !== today) return;
+    const byId = new Map(records.map((r) => [r.workout.id, r]));
+    const gymName = (id: string | null) => gyms?.find((g) => g.id === id)?.name ?? null;
+
+    // A server-side in-progress workout doesn't count if this phone finished or discarded it
+    let active = localActive ?? base.activeWorkout;
+    const activeRec = active && !localActive ? byId.get(active.id) : undefined;
+    if (activeRec && (activeRec.deleted || activeRec.workout.finished_at)) active = null;
+
+    const localToday = records
+      .filter((r) => !r.deleted && r.workout.finished_at && isToday(r.workout.started_at))
+      .map((r) => summarizeRecord(r, gymName));
+    const workouts = [
+      ...base.todayWorkouts.filter((w) => !byId.has(w.id)),
+      ...localToday,
+    ].sort((a, b) => b.started_at.localeCompare(a.started_at));
+
+    setActiveWorkout(active);
+    setTodayWorkouts(workouts);
+    setTodayRuns(
+      runs
+        .filter((r) => isToday(r.started_at))
+        .sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? ""))
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [today]);
 
   const load = useCallback(async () => {
-    const user = await getLocalUser(supabase);
-    if (!user) return;
     try {
-
     const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
     const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999).toISOString();
 
-    const [inProgressRes, todayWsRes, runsRes, trackingRes] = await Promise.all([
+    const [inProgressRes, todayWsRes, runsRes] = await Promise.all([
       supabase
         .from("workouts")
         .select("*")
@@ -152,32 +262,11 @@ export default function HomePage() {
         .gte("started_at", startOfDay)
         .lte("started_at", endOfDay)
         .order("started_at", { ascending: false }),
-      supabase
-        .from("daily_tracking")
-        .select("*")
-        .eq("date", today)
-        .maybeSingle(),
     ]);
-
-    let snapActive: Workout | null = inProgressRes.data?.[0] || null;
-    if (!snapActive) {
-      // Check localStorage for offline-cached active workout
-      try {
-        const cachedId = localStorage.getItem("active_workout_id");
-        if (cachedId) {
-          snapActive = { id: cachedId, finished_at: null } as Workout;
-        }
-      } catch {}
+    // Supabase reports "no signal" as an error, not an exception
+    if (inProgressRes.error || todayWsRes.error || runsRes.error) {
+      throw new Error("offline");
     }
-    setActiveWorkout(snapActive);
-    setTodayRuns(runsRes.data || []);
-
-    const snapProtein = trackingRes.data?.protein_grams ?? null;
-    const snapWeight = trackingRes.data?.morning_weight ?? null;
-    const snapTrackingId = trackingRes.data?.id ?? null;
-    setProtein(snapProtein);
-    setWeight(snapWeight);
-    setTrackingId(snapTrackingId);
 
     let snapTodayWorkouts: TodayWorkout[] = [];
     const todayWs = todayWsRes.data || [];
@@ -189,8 +278,9 @@ export default function HomePage() {
         supabase.from("workout_exercises").select("id, workout_id").in("workout_id", workoutIds),
         gymIds.length
           ? supabase.from("gyms").select("id, name").in("id", gymIds)
-          : Promise.resolve({ data: [] as { id: string; name: string }[] }),
+          : Promise.resolve({ data: [] as { id: string; name: string }[], error: null }),
       ]);
+      if (wesRes.error || gymsRes.error) throw new Error("offline");
 
       const gymMap = new Map((gymsRes.data || []).map((g) => [g.id, g.name]));
       const weIds = (wesRes.data || []).map((we) => we.id);
@@ -203,7 +293,8 @@ export default function HomePage() {
 
       let setsData: Database["public"]["Tables"]["sets"]["Row"][] = [];
       if (weIds.length) {
-        const { data } = await supabase.from("sets").select("*").in("workout_exercise_id", weIds);
+        const { data, error } = await supabase.from("sets").select("*").in("workout_exercise_id", weIds);
+        if (error) throw new Error("offline");
         setsData = data || [];
       }
 
@@ -237,7 +328,15 @@ export default function HomePage() {
         };
       });
     }
-    setTodayWorkouts(snapTodayWorkouts);
+
+    const base: HomeBase = {
+      activeWorkout: inProgressRes.data?.[0] || null,
+      todayWorkouts: snapTodayWorkouts,
+      todayRuns: runsRes.data || [],
+    };
+    networkLoadedRef.current = true;
+    await render(base);
+    setLoading(false);
 
     // Fetch calendar events (today + yesterday for missed detection)
     let snapCalendar: CalendarState = {
@@ -248,8 +347,8 @@ export default function HomePage() {
     };
     try {
       const [todayEventsRes, yesterdayEventsRes] = await Promise.all([
-        fetch(`/api/google/events?date=${today}`),
-        fetch(`/api/google/events?date=${yesterday}`),
+        fetch(`/api/google/events?date=${today}`, { signal: AbortSignal.timeout(8000) }),
+        fetch(`/api/google/events?date=${yesterday}`, { signal: AbortSignal.timeout(8000) }),
       ]);
       const todayData = await todayEventsRes.json();
       const yesterdayData = await yesterdayEventsRes.json();
@@ -280,41 +379,26 @@ export default function HomePage() {
       snapCalendar = calendarRef.current;
     }
 
-    networkLoadedRef.current = true;
-
     // Persist snapshot so the next open paints instantly
-    kvSet(`home:${today}`, {
-      activeWorkout: snapActive,
-      todayWorkouts: snapTodayWorkouts,
-      todayRuns: runsRes.data || [],
-      protein: snapProtein,
-      weight: snapWeight,
-      trackingId: snapTrackingId,
-      calendar: snapCalendar,
-    } satisfies HomeSnapshot);
+    kvSet(`home:${today}`, { ...base, calendar: snapCalendar } satisfies HomeSnapshot);
     } catch {
-      // Offline — the snapshot hydration effect has already painted what we have
-    } finally {
+      // No signal — show the last snapshot plus whatever is saved on this phone
+      await render(baseRef.current);
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [today]);
+  }, [today, render]);
 
   // Instant paint from the last snapshot while the network load runs
   useEffect(() => {
-    kvGet<HomeSnapshot>(`home:${today}`).then((snap) => {
-      if (!snap || networkLoadedRef.current) return;
-      setActiveWorkout(snap.activeWorkout);
-      setTodayWorkouts(snap.todayWorkouts);
-      setTodayRuns(snap.todayRuns);
-      setProtein(snap.protein);
-      setWeight(snap.weight);
-      setTrackingId(snap.trackingId);
-      setCalendar(snap.calendar);
+    kvGet<HomeSnapshot>(`home:${today}`).then(async (snap) => {
+      if (networkLoadedRef.current) return;
+      if (snap) setCalendar(snap.calendar);
+      await render(snap ?? EMPTY_BASE);
       setLoading(false);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [today]);
 
   useEffect(() => {
     load();
@@ -341,47 +425,32 @@ export default function HomePage() {
     }
   }, []);
 
-  async function saveProtein(value: number | null) {
-    setSavingProtein(true);
-    try {
-      const user = await getLocalUser(supabase);
-      if (!user) return;
-      if (trackingId) {
-        await supabase.from("daily_tracking").update({ protein_grams: value, updated_at: new Date().toISOString() }).eq("id", trackingId);
-      } else {
-        const { data } = await supabase.from("daily_tracking").insert({ user_id: user.id, date: today, protein_grams: value }).select().single();
-        if (data) setTrackingId(data.id);
-      }
-    } finally {
-      setSavingProtein(false);
-    }
-  }
-
-  async function saveWeight(value: number | null) {
-    setSavingWeight(true);
-    try {
-      const user = await getLocalUser(supabase);
-      if (!user) return;
-      if (trackingId) {
-        await supabase.from("daily_tracking").update({ morning_weight: value, updated_at: new Date().toISOString() }).eq("id", trackingId);
-      } else {
-        const { data } = await supabase.from("daily_tracking").insert({ user_id: user.id, date: today, morning_weight: value }).select().single();
-        if (data) setTrackingId(data.id);
-      }
-    } finally {
-      setSavingWeight(false);
-    }
+  /** Keep the cached server view in step with a local edit, for the next offline open. */
+  async function patchSnapshot(patch: (snap: HomeSnapshot) => HomeSnapshot) {
+    const snap = await kvGet<HomeSnapshot>(`home:${today}`);
+    await kvSet(`home:${today}`, patch(snap ?? { ...baseRef.current, calendar: calendarRef.current }));
   }
 
   async function handleStartWorkout(gym: { id: string; name: string }) {
     setGymPickerOpen(false);
-    const user = await getLocalUser(supabase);
-    if (!user) return;
-    const { data: workout } = await supabase
-      .from("workouts")
-      .insert({ user_id: user.id, gym_id: gym.id, title: `${gym.name} Workout`, started_at: new Date().toISOString(), workout_type: "lifting" })
-      .select().single();
-    if (workout) router.push(`/workout/${workout.id}`);
+    const userId = await getUserId(supabase);
+    if (!userId) return;
+    const startedAt = new Date().toISOString();
+    const workout: Workout = {
+      id: crypto.randomUUID(),
+      user_id: userId,
+      gym_id: gym.id,
+      title: `${gym.name} Workout`,
+      started_at: startedAt,
+      finished_at: null,
+      notes: null,
+      workout_type: "lifting",
+      created_at: startedAt,
+    };
+    // Created on the phone — works with zero signal, syncs later
+    await saveWorkoutLocal(workout.id, { workout, exercises: [], prs: {} }, { dirty: true });
+    try { localStorage.setItem("active_workout_id", workout.id); } catch {}
+    router.push(`/workout?id=${workout.id}`);
   }
 
   async function saveSoccer() {
@@ -389,10 +458,11 @@ export default function HomePage() {
     if (isNaN(minutes) || minutes <= 0) return;
     setSavingSoccer(true);
     try {
-      const user = await getLocalUser(supabase);
-      if (!user) return;
-      await supabase.from("run_sessions").insert({
-        user_id: user.id,
+      const userId = await getUserId(supabase);
+      if (!userId) return;
+      const insert = {
+        id: crypto.randomUUID(),
+        user_id: userId,
         source: "manual",
         name: "Soccer",
         run_pool: "soccer",
@@ -404,12 +474,24 @@ export default function HomePage() {
           type: "soccer",
           ...(soccerField.trim() ? { field: soccerField.trim() } : {}),
         },
-      });
+      };
+      await queueUpsert("run_sessions", insert);
+      const row: RunSession = {
+        strava_id: null,
+        run_workout: null,
+        distance_meters: null,
+        avg_pace: null,
+        avg_heart_rate: null,
+        polyline: null,
+        synced_at: insert.started_at,
+        ...insert,
+      };
+      await patchSnapshot((s) => ({ ...s, todayRuns: [row, ...s.todayRuns.filter((r) => r.id !== row.id)] }));
       setSoccerOpen(false);
       setSoccerMinutes("");
       setSoccerField("");
       setSoccerNotes("");
-      load();
+      await render({ ...baseRef.current, todayRuns: [row, ...baseRef.current.todayRuns] });
     } finally {
       setSavingSoccer(false);
     }
@@ -427,8 +509,8 @@ export default function HomePage() {
 
   async function createRunSession(template: RunTemplate, variantId: string | null) {
     setVariantPickerOpen(false);
-    const user = await getLocalUser(supabase);
-    if (!user) return;
+    const userId = await getUserId(supabase);
+    if (!userId) return;
 
     const variant = variantId && template.variants
       ? template.variants.find((v) => v.id === variantId)
@@ -436,24 +518,22 @@ export default function HomePage() {
 
     const name = variant ? `${template.name} — ${variant.label}` : template.name;
 
-    const { data: session } = await supabase
-      .from("run_sessions")
-      .insert({
-        user_id: user.id,
-        source: "manual",
-        name,
-        run_pool: template.pools[0],
-        run_workout: template.id,
-        started_at: new Date().toISOString(),
-        completed: false,
-        raw_data: {
-          templateId: template.id,
-          ...(variantId ? { variantId } : {}),
-        },
-      })
-      .select().single();
-
-    if (session) router.push(`/run/${session.id}`);
+    const id = crypto.randomUUID();
+    await queueUpsert("run_sessions", {
+      id,
+      user_id: userId,
+      source: "manual",
+      name,
+      run_pool: template.pools[0],
+      run_workout: template.id,
+      started_at: new Date().toISOString(),
+      completed: false,
+      raw_data: {
+        templateId: template.id,
+        ...(variantId ? { variantId } : {}),
+      },
+    });
+    router.push(`/run?id=${id}`);
   }
 
   if (loading) {
@@ -483,9 +563,11 @@ export default function HomePage() {
           </p>
         </div>
 
+        <SyncIndicator />
+
         {activeWorkout ? (
           <button
-            onClick={() => router.push(`/workout/${activeWorkout.id}`)}
+            onClick={() => router.push(`/workout?id=${activeWorkout.id}`)}
             className="flex h-14 w-full items-center justify-center gap-3 rounded-2xl bg-amber-600 text-white text-lg font-semibold shadow-lg shadow-amber-600/20 transition-all active:scale-[0.97]"
           >
             <Play className="h-5 w-5" />
@@ -583,36 +665,15 @@ export default function HomePage() {
           </button>
         )}
 
-        {/* Daily Tracking */}
-        <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-2xl border border-border bg-card p-4 space-y-1">
-            <div className="flex items-center gap-1.5">
-              <Flame className="h-3.5 w-3.5 text-orange-400" />
-              <p className="text-xs font-medium text-muted-foreground">Protein</p>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <Input type="number" inputMode="numeric" placeholder="—" value={protein ?? ""} onChange={(e) => setProtein(e.target.value ? parseInt(e.target.value) : null)} onBlur={() => saveProtein(protein)} className="h-10 text-center text-2xl font-bold font-mono border-0 bg-transparent p-0" />
-              <span className="text-xs text-muted-foreground shrink-0">g</span>
-            </div>
-          </div>
-          <div className="rounded-2xl border border-border bg-card p-4 space-y-1">
-            <div className="flex items-center gap-1.5">
-              <Weight className="h-3.5 w-3.5 text-blue-400" />
-              <p className="text-xs font-medium text-muted-foreground">Weight</p>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <Input type="number" inputMode="decimal" placeholder="—" value={weight ?? ""} onChange={(e) => setWeight(e.target.value ? parseFloat(e.target.value) : null)} onBlur={() => saveWeight(weight)} className="h-10 text-center text-2xl font-bold font-mono border-0 bg-transparent p-0" />
-              <span className="text-xs text-muted-foreground shrink-0">lb</span>
-            </div>
-          </div>
-        </div>
+        {/* Daily Tracking: protein / carbs / weight, by day */}
+        <DailyTracker />
 
         {/* Today's Workouts + Runs */}
         {(todayWorkouts.length > 0 || todayRuns.length > 0) && (
           <div className="space-y-2">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Today</h2>
             {todayWorkouts.map((w) => (
-              <button key={w.id} onClick={() => router.push(`/workout/${w.id}/summary`)} className="w-full rounded-2xl border border-border bg-card p-4 text-left transition-all hover:bg-accent active:scale-[0.98]">
+              <button key={w.id} onClick={() => router.push(`/workout/summary?id=${w.id}`)} className="w-full rounded-2xl border border-border bg-card p-4 text-left transition-all hover:bg-accent active:scale-[0.98]">
                 <div className="flex items-center gap-3">
                   <div className="h-9 w-9 rounded-xl bg-green-600/15 flex items-center justify-center shrink-0">
                     <Check className="h-4 w-4 text-green-500" />
@@ -635,7 +696,7 @@ export default function HomePage() {
                 ? ((r.raw_data as { field?: string } | null)?.field ?? null)
                 : null;
               return (
-                <button key={r.id} onClick={() => router.push(`/run/${r.id}`)} className="w-full rounded-2xl border border-border bg-card p-4 text-left transition-all hover:bg-accent active:scale-[0.98]">
+                <button key={r.id} onClick={() => router.push(`/run?id=${r.id}`)} className="w-full rounded-2xl border border-border bg-card p-4 text-left transition-all hover:bg-accent active:scale-[0.98]">
                   <div className="flex items-center gap-3">
                     <div className={`h-9 w-9 rounded-xl flex items-center justify-center shrink-0 ${isSoccer ? "bg-sky-500/15" : done ? "bg-green-600/15" : "bg-amber-500/15"}`}>
                       {isSoccer ? <Goal className="h-4 w-4 text-sky-400" /> : done ? <Check className="h-4 w-4 text-green-500" /> : <Footprints className="h-4 w-4 text-amber-400" />}

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { kvGet, kvSet } from "@/lib/offline";
 import { Database, TrackingMode, PrType } from "@/types/database.types";
 import {
   Drawer,
@@ -72,13 +73,21 @@ export function ExerciseHistorySheet({
 
   const loadHistory = useCallback(async () => {
     setLoading(true);
+    const cacheKey = `exhist:${exerciseId}`;
+    // Last copy from the phone first; a failed refresh leaves it on screen
+    const cached = await kvGet<HistorySession[]>(cacheKey);
+    if (cached) {
+      setSessions(cached);
+      setLoading(false);
+    }
     try {
-      const { data: wes } = await supabase
+      const { data: wes, error: wesErr } = await supabase
         .from("workout_exercises")
         .select("id, workout_id, notes, mode, created_at")
         .eq("exercise_id", exerciseId)
         .order("created_at", { ascending: false })
         .limit(30);
+      if (wesErr) return;
 
       if (!wes?.length) {
         setSessions([]);
@@ -86,11 +95,12 @@ export function ExerciseHistorySheet({
       }
 
       const workoutIds = [...new Set(wes.map((we) => we.workout_id))];
-      const { data: workouts } = await supabase
+      const { data: workouts, error: wErr } = await supabase
         .from("workouts")
         .select("id, started_at, finished_at, gym_id")
         .in("id", workoutIds)
         .not("finished_at", "is", null);
+      if (wErr) return;
 
       const workoutMap = new Map((workouts || []).map((w) => [w.id, w]));
 
@@ -104,14 +114,15 @@ export function ExerciseHistorySheet({
 
       const finishedWes = wes.filter((we) => workoutMap.has(we.workout_id));
       const weIds = finishedWes.map((we) => we.id);
-      const { data: allSets } = weIds.length
+      const { data: allSets, error: setsErr } = weIds.length
         ? await supabase
             .from("sets")
             .select("*")
             .in("workout_exercise_id", weIds)
             .not("completed_at", "is", null)
             .order("set_number")
-        : { data: [] as SetRow[] };
+        : { data: [] as SetRow[], error: null };
+      if (setsErr) return;
 
       const setsByWe = new Map<string, SetRow[]>();
       for (const s of allSets || []) {
@@ -137,6 +148,7 @@ export function ExerciseHistorySheet({
         .slice(0, 15);
 
       setSessions(result);
+      kvSet(cacheKey, result);
     } finally {
       setLoading(false);
       setLoaded(true);

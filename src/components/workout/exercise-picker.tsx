@@ -1,8 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { createClient, getLocalUser } from "@/lib/supabase/client";
+import { createClient, getUserId } from "@/lib/supabase/client";
 import { Database, Equipment, TrackingMode } from "@/types/database.types";
+import { queueUpsert } from "@/lib/offline";
+import {
+  getCachedExercises,
+  getCachedPools,
+  putCachedRow,
+  refreshLibrary,
+} from "@/lib/reference-data";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
@@ -98,18 +105,28 @@ export function ExercisePicker({
   const supabase = createClient();
 
   useEffect(() => {
-    if (open) {
-      Promise.all([
-        supabase.from("exercise_definitions").select("*").order("name"),
-        supabase.from("exercise_pools").select("*").order("sort_order"),
-      ]).then(([exRes, poolRes]) => {
-        setExercises(exRes.data || []);
-        setPools(poolRes.data || []);
-        setLoading(false);
-      });
-      setSearch("");
-      setCreating(false);
-    }
+    if (!open) return;
+    setSearch("");
+    setCreating(false);
+    let cancelled = false;
+    // Library from the phone instantly; refresh behind it if there's signal
+    Promise.all([getCachedExercises(), getCachedPools()]).then(([ex, pl]) => {
+      if (cancelled || !ex) return;
+      setExercises(ex);
+      setPools(pl || []);
+      setLoading(false);
+    });
+    refreshLibrary(supabase).then((fresh) => {
+      if (cancelled) return;
+      if (fresh) {
+        setExercises(fresh.exercises);
+        setPools(fresh.pools);
+      }
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [open, supabase]);
 
   function toggleMode(mode: TrackingMode) {
@@ -127,49 +144,48 @@ export function ExercisePicker({
   async function handleCreate() {
     if (!newName.trim() || !newEquipment || !newPoolId) return;
     setSaving(true);
+    try {
+      const userId = await getUserId(supabase);
+      if (!userId) return;
 
-    const user = await getLocalUser(supabase);
-    if (!user) return;
-
-    const { data } = await supabase
-      .from("exercise_definitions")
-      .insert({
-        user_id: user.id,
+      // Created on the phone; syncs before any workout that uses it
+      const exercise: Exercise = {
+        id: crypto.randomUUID(),
+        user_id: userId,
         name: newName.trim(),
         equipment: newEquipment,
         pool_id: newPoolId,
         default_mode: defaultMode,
         supports_modes: supportsModes,
         notes: newNotes || null,
-      })
-      .select()
-      .single();
-
-    setSaving(false);
-    if (data) {
-      onSelect(data);
+        created_at: new Date().toISOString(),
+      };
+      await queueUpsert("exercise_definitions", exercise);
+      await putCachedRow("exercises", exercise);
+      setExercises((prev) => [...prev, exercise]);
+      onSelect(exercise);
       onOpenChange(false);
+    } finally {
+      setSaving(false);
     }
   }
 
   async function handleCreatePool() {
-    const user = await getLocalUser(supabase);
-    if (!user) return;
+    const userId = await getUserId(supabase);
+    if (!userId) return;
 
-    const { data } = await supabase
-      .from("exercise_pools")
-      .insert({
-        user_id: user.id,
-        name: newPoolName.trim(),
-        sort_order: pools.length,
-      })
-      .select()
-      .single();
-
-    if (data) {
-      setPools((prev) => [...prev, data]);
-      setNewPoolId(data.id);
-    }
+    const pool: Pool = {
+      id: crypto.randomUUID(),
+      user_id: userId,
+      name: newPoolName.trim(),
+      parent_pool_id: null,
+      sort_order: pools.length,
+      created_at: new Date().toISOString(),
+    };
+    await queueUpsert("exercise_pools", pool);
+    await putCachedRow("pools", pool);
+    setPools((prev) => [...prev, pool]);
+    setNewPoolId(pool.id);
     setNewPoolName("");
     setNewPoolOpen(false);
   }

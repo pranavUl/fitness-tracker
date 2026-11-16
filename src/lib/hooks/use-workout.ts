@@ -1,378 +1,400 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { createClient, getLocalUser } from "@/lib/supabase/client";
-import { Database, TrackingMode, PrType } from "@/types/database.types";
+import { SupabaseClient } from "@supabase/supabase-js";
+import { createClient } from "@/lib/supabase/client";
+import { Database, PrType } from "@/types/database.types";
 import { SetData } from "@/components/workout/set-row";
-import { detectPRs, savePRs, computeE1rm } from "@/lib/pr-detection";
-import { PR_FLAG_MAP } from "@/lib/pr-constants";
-import { revokeAndRecomputePRs } from "@/lib/pr-recompute";
+import { computeE1rm } from "@/lib/pr-detection";
 import { haptic, HAPTIC } from "@/lib/haptics";
 import {
-  cacheWorkout,
+  hasUnsyncedChanges,
   loadCachedWorkout,
-  clearCachedWorkout,
-  syncToSupabase,
-  CachedWorkout,
+  saveWorkoutLocal,
 } from "@/lib/offline";
+import { requestSync, subscribeWorkoutPrs } from "@/lib/sync";
+import {
+  PrevMap,
+  getPrevMap,
+  pickPrevious,
+  recordFinishedWorkout,
+  refreshPrevMap,
+} from "@/lib/reference-data";
+import {
+  ExerciseDefinition,
+  PreviousSession,
+  PrOp,
+  Workout,
+  WorkoutExercise,
+  WorkoutExerciseState,
+  WorkoutSnapshot,
+  applyPrPatch,
+  setPrTypes,
+} from "@/lib/workout-state";
 
-type Workout = Database["public"]["Tables"]["workouts"]["Row"];
-type WorkoutExercise = Database["public"]["Tables"]["workout_exercises"]["Row"];
-type ExerciseDefinition =
-  Database["public"]["Tables"]["exercise_definitions"]["Row"];
+export type { WorkoutExerciseState } from "@/lib/workout-state";
 
-interface PreviousSession {
-  sets: SetData[];
-  note: string | null;
-  date: string;
+/** Why a workout can't be shown: gone, or never saved to this phone and no signal. */
+export type WorkoutUnavailable = "not-found" | "offline" | null;
+
+const ACTIVE_KEY = "active_workout_id";
+
+function setActivePointer(id: string | null) {
+  try {
+    if (id) localStorage.setItem(ACTIVE_KEY, id);
+    else localStorage.removeItem(ACTIVE_KEY);
+  } catch {}
 }
 
-export interface WorkoutExerciseState {
-  workoutExercise: WorkoutExercise;
-  definition: ExerciseDefinition;
-  sets: SetData[];
-  previous: PreviousSession | null;
+/** Preload every completed set from the last session at this gym, unchecked. */
+function setsFromPrevious(prev: PreviousSession | null): SetData[] {
+  const prevSets = (prev?.sets || []).filter((s) => s.completed_at);
+  const templates = prevSets.length > 0 ? prevSets : [null];
+  return templates.map((p, i) => ({
+    id: crypto.randomUUID(),
+    set_number: i + 1,
+    reps: p?.reps ?? null,
+    weight: p?.weight ?? null,
+    duration_seconds: p?.duration_seconds ?? null,
+    is_warmup: p?.is_warmup ?? false,
+    note: p?.note ?? null,
+    completed_at: null,
+  }));
 }
 
-export function useWorkout(workoutId: string) {
+function isPristine(sets: SetData[]): boolean {
+  return (
+    sets.length === 1 &&
+    !sets[0].completed_at &&
+    sets[0].reps == null &&
+    sets[0].weight == null &&
+    sets[0].duration_seconds == null &&
+    !sets[0].note
+  );
+}
+
+async function fetchWorkout(
+  supabase: SupabaseClient<Database>,
+  workoutId: string
+): Promise<WorkoutSnapshot | null | "offline"> {
+  const wRes = await supabase
+    .from("workouts")
+    .select("*")
+    .eq("id", workoutId)
+    .maybeSingle();
+  if (wRes.error) return "offline";
+  if (!wRes.data) return null;
+
+  const weRes = await supabase
+    .from("workout_exercises")
+    .select("*")
+    .eq("workout_id", workoutId)
+    .order("sort_order");
+  if (weRes.error) return "offline";
+  const wes = weRes.data;
+  if (!wes.length) return { workout: wRes.data, exercises: [], prs: {} };
+
+  const [defsRes, setsRes] = await Promise.all([
+    supabase
+      .from("exercise_definitions")
+      .select("*")
+      .in("id", [...new Set(wes.map((we) => we.exercise_id))]),
+    supabase
+      .from("sets")
+      .select("*")
+      .in(
+        "workout_exercise_id",
+        wes.map((we) => we.id)
+      )
+      .order("set_number"),
+  ]);
+  if (defsRes.error || setsRes.error) return "offline";
+
+  const defMap = new Map(defsRes.data.map((d) => [d.id, d]));
+  const setsByWe = new Map<string, SetData[]>();
+  const prs: Record<string, PrType[]> = {};
+  for (const s of setsRes.data) {
+    const arr = setsByWe.get(s.workout_exercise_id) || [];
+    arr.push({
+      id: s.id,
+      set_number: s.set_number,
+      reps: s.reps,
+      weight: s.weight,
+      duration_seconds: s.duration_seconds,
+      is_warmup: s.is_warmup,
+      note: s.note,
+      completed_at: s.completed_at,
+      e1rm: s.e1rm,
+      rest_seconds: s.rest_seconds,
+      is_pr_weight: s.is_pr_weight,
+      is_pr_1rm: s.is_pr_1rm,
+      is_pr_volume: s.is_pr_volume,
+      is_pr_reps: s.is_pr_reps,
+      is_pr_duration: s.is_pr_duration,
+    });
+    setsByWe.set(s.workout_exercise_id, arr);
+    const types = setPrTypes(s);
+    if (types.length > 0) prs[s.id] = types;
+  }
+
+  const exercises = wes
+    .filter((we) => defMap.has(we.exercise_id))
+    .map((we) => ({
+      workoutExercise: we,
+      definition: defMap.get(we.exercise_id)!,
+      sets: setsByWe.get(we.id) || [],
+      previous: null,
+    }));
+  return { workout: wRes.data, exercises, prs };
+}
+
+export function useWorkout(workoutId: string | null) {
   const [workout, setWorkout] = useState<Workout | null>(null);
   const [exercises, setExercises] = useState<WorkoutExerciseState[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [elapsed, setElapsed] = useState(0);
   const [prs, setPrs] = useState<Record<string, PrType[]>>({});
-  const [isOffline, setIsOffline] = useState(false);
-  const [pendingSync, setPendingSync] = useState(false);
-  const supabase = createClient();
-  const userIdRef = useRef<string | null>(null);
-  const exercisesRef = useRef<WorkoutExerciseState[]>([]);
+  const [loadingState, setLoading] = useState(true);
+  const [unavailableState, setUnavailable] = useState<WorkoutUnavailable>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const loading = workoutId ? loadingState : false;
+  const unavailable: WorkoutUnavailable = workoutId ? unavailableState : "not-found";
+
   const workoutRef = useRef<Workout | null>(null);
+  const exercisesRef = useRef<WorkoutExerciseState[]>([]);
   const prsRef = useRef<Record<string, PrType[]>>({});
-  // All PR reads/writes run through this chain so rapid set completions,
-  // unchecks, and deletes can never interleave and race each other.
-  const prOpChainRef = useRef<Promise<void>>(Promise.resolve());
-  // True once the user mutates anything — a late-arriving network load
-  // must not clobber their local changes.
-  const dirtyRef = useRef(false);
-  // Debounced set-value writes: state updates are instant, the network
-  // write fires after typing settles (one request instead of one per key).
-  const writeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const pendingWritesRef = useRef<Map<string, SetData>>(new Map());
-  useEffect(() => { exercisesRef.current = exercises; }, [exercises]);
-  useEffect(() => { workoutRef.current = workout; }, [workout]);
-  useEffect(() => { prsRef.current = prs; }, [prs]);
+  const prevMapRef = useRef<PrevMap | null>(null);
+  // Once the user edits anything, a late server response must not clobber it
+  const editedRef = useRef(false);
+  // Exercises added before their ghost data was available; filled in if it arrives
+  const awaitingPrefillRef = useRef<Set<string>>(new Set());
 
-  const queuePrOp = useCallback((op: () => Promise<void>) => {
-    prOpChainRef.current = prOpChainRef.current
-      .then(op)
-      .catch((err) => console.error("[PR] op failed:", err));
-  }, []);
-
-  // Merge restored PR badges (from recompute) into local state.
-  const applyRestoredBadges = useCallback((restored: Record<string, PrType[]>) => {
-    const ids = Object.keys(restored);
-    if (ids.length === 0) return;
-    setPrs((prev) => {
-      const next = { ...prev };
-      for (const [sid, types] of Object.entries(restored)) {
-        next[sid] = [...new Set([...(next[sid] || []), ...types])];
+  /**
+   * The single write path: refs, React state, and the on-device mirror move
+   * together. Dirty writes get picked up by the sync engine automatically.
+   */
+  const commit = useCallback(
+    (
+      next: Partial<WorkoutSnapshot>,
+      opts: { dirty: boolean; prOps?: PrOp[]; deleted?: boolean }
+    ): Promise<void> => {
+      if (next.workout !== undefined) {
+        workoutRef.current = next.workout;
+        setWorkout(next.workout);
       }
-      return next;
-    });
-    setExercises((prev) =>
-      prev.map((e) => ({
-        ...e,
-        sets: e.sets.map((s) => {
-          const types = s.id ? restored[s.id] : undefined;
-          if (!types) return s;
-          const updated = { ...s };
-          for (const t of types) {
-            if (t === "WEIGHT") updated.is_pr_weight = true;
-            else if (t === "1RM") updated.is_pr_1rm = true;
-            else if (t === "VOL") updated.is_pr_volume = true;
-            else if (t === "REPS") updated.is_pr_reps = true;
-            else if (t === "DURATION") updated.is_pr_duration = true;
-          }
-          return updated;
-        }),
-      }))
-    );
-  }, []);
-
-  // Cache to IndexedDB on every state change + track active workout in localStorage
-  useEffect(() => {
-    if (!workout || loading) return;
-    if (!workout.finished_at) {
-      try { localStorage.setItem("active_workout_id", workoutId); } catch {}
-    }
-    const data: CachedWorkout = {
-      workout,
-      exercises,
-      prs,
-      savedAt: Date.now(),
-    };
-    cacheWorkout(workoutId, data);
-  }, [workout, exercises, prs, workoutId, loading]);
-
-  // Online/offline detection + sync on reconnect
-  useEffect(() => {
-    const goOffline = () => setIsOffline(true);
-    const goOnline = async () => {
-      setIsOffline(false);
+      if (next.exercises !== undefined) {
+        exercisesRef.current = next.exercises;
+        setExercises(next.exercises);
+      }
+      if (next.prs !== undefined) {
+        prsRef.current = next.prs;
+        setPrs(next.prs);
+      }
+      if (opts.dirty) editedRef.current = true;
       const w = workoutRef.current;
-      if (!w || !pendingSync) return;
-      const synced = await syncToSupabase(supabase, {
-        workout: w,
-        exercises: exercisesRef.current,
+      if (!w || !workoutId) return Promise.resolve();
+      return saveWorkoutLocal(
+        workoutId,
+        { workout: w, exercises: exercisesRef.current, prs: prsRef.current },
+        opts
+      );
+    },
+    [workoutId]
+  );
+
+  const fillPrevious = useCallback(
+    (map: PrevMap | null) => {
+      if (!map || !workoutId) return;
+      prevMapRef.current = map;
+      let changed = false;
+      let prefilled = false;
+      const next = exercisesRef.current.map((e) => {
+        const prev = pickPrevious(map, e.definition.id, workoutId);
+        if (!prev) return e;
+        const weId = e.workoutExercise.id;
+        if (awaitingPrefillRef.current.has(weId)) {
+          awaitingPrefillRef.current.delete(weId);
+          if (isPristine(e.sets)) {
+            prefilled = true;
+            changed = true;
+            return { ...e, previous: prev, sets: setsFromPrevious(prev) };
+          }
+        }
+        if (e.previous?.workoutId === prev.workoutId && e.previous?.date === prev.date) {
+          return e;
+        }
+        changed = true;
+        return { ...e, previous: prev };
       });
-      if (synced) setPendingSync(false);
-    };
+      if (changed) commit({ exercises: next }, { dirty: prefilled });
+    },
+    [workoutId, commit]
+  );
 
-    window.addEventListener("offline", goOffline);
-    window.addEventListener("online", goOnline);
-    if (!navigator.onLine) setIsOffline(true);
-
-    return () => {
-      window.removeEventListener("offline", goOffline);
-      window.removeEventListener("online", goOnline);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingSync]);
-
-  const loadWorkout = useCallback(async () => {
-    // 1. Paint instantly from the local mirror if we have one
-    const cached = await loadCachedWorkout(workoutId);
-    if (cached && !dirtyRef.current) {
-      setWorkout(cached.workout);
-      setExercises(cached.exercises);
-      setPrs(cached.prs);
-      setLoading(false);
-    }
-
-    const user = await getLocalUser(supabase);
-    userIdRef.current = user?.id ?? null;
-
-    // 2. Reconcile with the server in the background
-    try {
-      const { data: w } = await supabase
-        .from("workouts")
-        .select("*")
-        .eq("id", workoutId)
-        .single();
-
-      if (!w) throw new Error("not found");
-      if (dirtyRef.current) return; // user is already editing — local wins
-      setWorkout(w);
-
-      const { data: wes } = await supabase
-        .from("workout_exercises")
-        .select("*")
-        .eq("workout_id", workoutId)
-        .order("sort_order");
-
-      if (dirtyRef.current) return;
-
-      if (!wes?.length) {
-        setExercises([]);
+  // Load: phone first, then reconcile with the server if the phone has nothing
+  // unsynced. Callers remount per workout id (key={id}), so state starts clean.
+  useEffect(() => {
+    if (!workoutId) return;
+    let cancelled = false;
+    (async () => {
+      const cached = await loadCachedWorkout(workoutId);
+      if (cancelled) return;
+      if (cached?.deleted) {
+        setUnavailable("not-found");
         setLoading(false);
         return;
       }
-
-      const exerciseIds = [...new Set(wes.map((we) => we.exercise_id))];
-      const { data: defs } = await supabase
-        .from("exercise_definitions")
-        .select("*")
-        .in("id", exerciseIds);
-
-      const defMap = new Map((defs || []).map((d) => [d.id, d]));
-
-      const weIds = wes.map((we) => we.id);
-      const { data: allSets } = await supabase
-        .from("sets")
-        .select("*")
-        .in("workout_exercise_id", weIds)
-        .order("set_number");
-
-      const setsByWe = new Map<string, SetData[]>();
-      const initialPrs: Record<string, PrType[]> = {};
-      for (const s of allSets || []) {
-        const arr = setsByWe.get(s.workout_exercise_id) || [];
-        arr.push({
-          id: s.id,
-          set_number: s.set_number,
-          reps: s.reps,
-          weight: s.weight,
-          duration_seconds: s.duration_seconds,
-          is_warmup: s.is_warmup,
-          note: s.note,
-          completed_at: s.completed_at,
-          e1rm: s.e1rm,
-          rest_seconds: s.rest_seconds,
-          is_pr_weight: s.is_pr_weight,
-          is_pr_1rm: s.is_pr_1rm,
-          is_pr_volume: s.is_pr_volume,
-          is_pr_reps: s.is_pr_reps,
-          is_pr_duration: s.is_pr_duration,
-        });
-        setsByWe.set(s.workout_exercise_id, arr);
-
-        const setPrs: PrType[] = [];
-        if (s.is_pr_weight) setPrs.push("WEIGHT");
-        if (s.is_pr_1rm) setPrs.push("1RM");
-        if (s.is_pr_volume) setPrs.push("VOL");
-        if (s.is_pr_reps) setPrs.push("REPS");
-        if (s.is_pr_duration) setPrs.push("DURATION");
-        if (setPrs.length > 0) initialPrs[s.id] = setPrs;
-      }
-      const exerciseStates = wes
-        .map((we) => ({
-          workoutExercise: we,
-          definition: defMap.get(we.exercise_id)!,
-          sets: setsByWe.get(we.id) || [],
-          previous: null as PreviousSession | null,
-        }))
-        .filter((e) => e.definition);
-
-      if (dirtyRef.current) return;
-      setPrs(initialPrs);
-      setExercises(exerciseStates);
-      setLoading(false);
-
-      if (w.gym_id) {
-        for (const ex of exerciseStates) {
-          fetchPrevious(ex.definition.id, w.gym_id, workoutId).then((prev) => {
-            if (prev) {
-              setExercises((current) =>
-                current.map((e) =>
-                  e.workoutExercise.id === ex.workoutExercise.id
-                    ? { ...e, previous: prev }
-                    : e
-                )
-              );
-            }
-          });
-        }
-      }
-    } catch {
-      // Supabase unreachable — cached data (if any) is already painted
       if (cached) {
-        setPendingSync(true);
-        setIsOffline(true);
+        workoutRef.current = cached.workout;
+        exercisesRef.current = cached.exercises;
+        prsRef.current = cached.prs;
+        setWorkout(cached.workout);
+        setExercises(cached.exercises);
+        setPrs(cached.prs);
+        setLoading(false);
       }
-      setLoading(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workoutId]);
 
-  async function fetchPrevious(
-    exerciseId: string,
-    gymId: string,
-    currentWorkoutId: string
-  ): Promise<PreviousSession | null> {
-    try {
-      const { data: workouts } = await supabase
-        .from("workouts")
-        .select("id, started_at")
-        .eq("gym_id", gymId)
-        .not("finished_at", "is", null)
-        .neq("id", currentWorkoutId)
-        .order("started_at", { ascending: false })
-        .limit(20);
+      if (cached && hasUnsyncedChanges(cached)) {
+        // The phone has edits the server hasn't seen — it's the source of truth
+        requestSync(0);
+        return;
+      }
 
-      if (!workouts?.length) return null;
-
-      const workoutIds = workouts.map((w) => w.id);
-
-      const { data: wes } = await supabase
-        .from("workout_exercises")
-        .select("id, workout_id, notes")
-        .eq("exercise_id", exerciseId)
-        .in("workout_id", workoutIds);
-
-      if (!wes?.length) return null;
-
-      // workouts are ordered newest-first; take the most recent one
-      // that actually contained this exercise
-      let match: (typeof wes)[number] | null = null;
-      let wo: (typeof workouts)[number] | null = null;
-      for (const w of workouts) {
-        const found = wes.find((x) => x.workout_id === w.id);
-        if (found) {
-          match = found;
-          wo = w;
-          break;
+      const server = await fetchWorkout(createClient(), workoutId);
+      if (cancelled || editedRef.current) return;
+      if (server === "offline" || server === null) {
+        // Keep whatever the phone has; only complain if it has nothing
+        if (!cached) {
+          setUnavailable(server === null ? "not-found" : "offline");
+          setLoading(false);
         }
+        return;
       }
-      if (!match) return null;
+      // Carry over ghost data already on screen
+      const prevByWe = new Map(
+        exercisesRef.current.map((e) => [e.workoutExercise.id, e.previous])
+      );
+      await commit(
+        {
+          ...server,
+          exercises: server.exercises.map((e) => ({
+            ...e,
+            previous: prevByWe.get(e.workoutExercise.id) ?? null,
+          })),
+        },
+        { dirty: false }
+      );
+      if (!cancelled) setLoading(false);
+    })();
 
-      const weId = match.id;
+    return () => {
+      cancelled = true;
+    };
+  }, [workoutId, commit]);
 
-      const { data: sets } = await supabase
-        .from("sets")
-        .select("*")
-        .eq("workout_exercise_id", weId)
-        .order("set_number");
+  const gymId = workout?.gym_id ?? null;
+  const unfinished = !!workout && !workout.finished_at;
 
-      return {
-        sets: (sets || []).map((s) => ({
-          id: s.id,
-          set_number: s.set_number,
-          reps: s.reps,
-          weight: s.weight,
-          duration_seconds: s.duration_seconds,
-          is_warmup: s.is_warmup,
-          note: s.note,
-          completed_at: s.completed_at,
-        })),
-        note: match.notes,
-        date: wo?.started_at || "",
-      };
-    } catch {
-      return null;
-    }
-  }
+  // Track the in-progress workout so Home can offer "Resume"
+  useEffect(() => {
+    if (unfinished && workoutId) setActivePointer(workoutId);
+  }, [unfinished, workoutId]);
+
+  // Ghost values: instantly from the phone, then refreshed if there's signal
+  useEffect(() => {
+    if (!gymId) return;
+    let cancelled = false;
+    getPrevMap(gymId).then((map) => {
+      if (!cancelled) fillPrevious(map);
+    });
+    refreshPrevMap(createClient(), gymId)
+      .then((map) => {
+        if (!cancelled) fillPrevious(map);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [gymId, fillPrevious]);
+
+  // PR results computed by the sync engine (possibly long after the set was logged)
+  useEffect(() => {
+    if (!workoutId) return;
+    return subscribeWorkoutPrs(workoutId, (patch) => {
+      const before = patch.kind === "detected" ? prsRef.current[patch.setId] || [] : [];
+      commit(
+        applyPrPatch({ exercises: exercisesRef.current, prs: prsRef.current }, patch),
+        { dirty: false }
+      );
+      if (patch.kind === "detected" && patch.types.some((t) => !before.includes(t))) {
+        haptic(HAPTIC.pr);
+      }
+    });
+  }, [workoutId, commit]);
 
   useEffect(() => {
-    loadWorkout();
-  }, [loadWorkout]);
-
-  useEffect(() => {
-    if (!workout) return;
-
-    const start = new Date(workout.started_at).getTime();
-
-    if (workout.finished_at) {
-      const end = new Date(workout.finished_at).getTime();
-      setElapsed(Math.floor((end - start) / 1000));
-      return;
-    }
-
-    const tick = () => setElapsed(Math.floor((Date.now() - start) / 1000));
-    tick();
-    const interval = setInterval(tick, 1000);
+    if (!unfinished) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(interval);
-  }, [workout]);
+  }, [unfinished]);
+
+  const elapsed = workout
+    ? Math.max(
+        0,
+        Math.floor(
+          ((workout.finished_at ? new Date(workout.finished_at).getTime() : now) -
+            new Date(workout.started_at).getTime()) /
+            1000
+        )
+      )
+    : 0;
+
+  // ---- Mutations: all synchronous against local state ----
+
+  const findEx = (weId: string) =>
+    exercisesRef.current.find((e) => e.workoutExercise.id === weId);
+
+  const mapEx = (
+    weId: string,
+    fn: (e: WorkoutExerciseState) => WorkoutExerciseState
+  ) =>
+    exercisesRef.current.map((e) => (e.workoutExercise.id === weId ? fn(e) : e));
+
+  const revokeOp = (ex: WorkoutExerciseState, setIds: string[]): PrOp => ({
+    id: crypto.randomUUID(),
+    kind: "revoke",
+    setIds,
+    exerciseId: ex.definition.id,
+    equipment: ex.definition.equipment,
+    gymId: workoutRef.current?.gym_id ?? null,
+  });
+
+  const detectOp = (weId: string, setId: string): PrOp => ({
+    id: crypto.randomUUID(),
+    kind: "detect",
+    setId,
+    weId,
+  });
+
+  const withoutPrs = (setIds: string[]) => {
+    if (!setIds.some((id) => prsRef.current[id])) return prsRef.current;
+    const next = { ...prsRef.current };
+    for (const id of setIds) delete next[id];
+    return next;
+  };
 
   const addExercise = useCallback(
-    async (definition: ExerciseDefinition) => {
-      if (!userIdRef.current || !workout) return;
-      dirtyRef.current = true;
-
-      const sortOrder = exercisesRef.current.length;
+    (definition: ExerciseDefinition) => {
+      const w = workoutRef.current;
+      if (!w) return;
       const weId = crypto.randomUUID();
-
-      let prev: PreviousSession | null = null;
-      if (workout.gym_id) {
-        try {
-          prev = await fetchPrevious(definition.id, workout.gym_id, workoutId);
-        } catch {}
-      }
+      const prev = pickPrevious(prevMapRef.current, definition.id, w.id);
+      if (!prev) awaitingPrefillRef.current.add(weId);
 
       const weRow: WorkoutExercise = {
         id: weId,
-        user_id: userIdRef.current,
-        workout_id: workoutId,
+        user_id: w.user_id,
+        workout_id: w.id,
         exercise_id: definition.id,
-        sort_order: sortOrder,
+        sort_order: exercisesRef.current.length,
         mode: definition.default_mode,
         is_warmup_group: false,
         notes: null,
@@ -380,80 +402,34 @@ export function useWorkout(workoutId: string) {
         created_at: new Date().toISOString(),
       };
 
-      // Preload every set from the previous session at this gym —
-      // values, warmup flags, and notes — all unchecked.
-      const prevSets = (prev?.sets || []).filter((s) => s.completed_at);
-      const templates = prevSets.length > 0 ? prevSets : [null];
-      const setRows: SetData[] = templates.map((p, i) => ({
-        id: crypto.randomUUID(),
-        set_number: i + 1,
-        reps: p?.reps ?? null,
-        weight: p?.weight ?? null,
-        duration_seconds: p?.duration_seconds ?? null,
-        is_warmup: p?.is_warmup ?? false,
-        note: p?.note ?? null,
-        completed_at: null,
-      }));
-
-      setExercises((current) => [
-        ...current,
+      commit(
         {
-          workoutExercise: weRow,
-          definition,
-          sets: setRows,
-          previous: prev,
+          exercises: [
+            ...exercisesRef.current,
+            {
+              workoutExercise: weRow,
+              definition,
+              sets: setsFromPrevious(prev),
+              previous: prev,
+            },
+          ],
         },
-      ]);
-
-      try {
-        await supabase.from("workout_exercises").insert({
-          id: weId,
-          user_id: userIdRef.current,
-          workout_id: workoutId,
-          exercise_id: definition.id,
-          sort_order: sortOrder,
-          mode: definition.default_mode,
-        });
-        await supabase.from("sets").insert(
-          setRows.map((s) => ({
-            id: s.id,
-            user_id: userIdRef.current!,
-            workout_exercise_id: weId,
-            set_number: s.set_number,
-            reps: s.reps,
-            weight: s.weight,
-            duration_seconds: s.duration_seconds,
-            is_warmup: s.is_warmup,
-            note: s.note,
-          }))
-        );
-      } catch {
-        setPendingSync(true);
-      }
+        { dirty: true }
+      );
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [workoutId, workout]
+    [commit]
   );
 
   const addSet = useCallback(
-    async (workoutExerciseId: string) => {
-      if (!userIdRef.current) return;
-      dirtyRef.current = true;
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
-      );
+    (weId: string) => {
+      const ex = findEx(weId);
       if (!ex) return;
-
+      awaitingPrefillRef.current.delete(weId);
       const nextNum =
-        ex.sets.length > 0
-          ? Math.max(...ex.sets.map((s) => s.set_number)) + 1
-          : 1;
-
+        ex.sets.length > 0 ? Math.max(...ex.sets.map((s) => s.set_number)) + 1 : 1;
       const prefill = ex.previous?.sets[ex.sets.length];
-      const setId = crypto.randomUUID();
-
       const setRow: SetData = {
-        id: setId,
+        id: crypto.randomUUID(),
         set_number: nextNum,
         reps: prefill?.reps ?? null,
         weight: prefill?.weight ?? null,
@@ -462,123 +438,77 @@ export function useWorkout(workoutId: string) {
         note: prefill?.note ?? null,
         completed_at: null,
       };
-
-      setExercises((prev) =>
-        prev.map((e) =>
-          e.workoutExercise.id === workoutExerciseId
-            ? { ...e, sets: [...e.sets, setRow] }
-            : e
-        )
+      commit(
+        { exercises: mapEx(weId, (e) => ({ ...e, sets: [...e.sets, setRow] })) },
+        { dirty: true }
       );
-
-      try {
-        await supabase.from("sets").insert({
-          id: setId,
-          user_id: userIdRef.current,
-          workout_exercise_id: workoutExerciseId,
-          set_number: nextNum,
-          reps: prefill?.reps ?? null,
-          weight: prefill?.weight ?? null,
-          duration_seconds: prefill?.duration_seconds ?? null,
-          note: prefill?.note ?? null,
-        });
-      } catch {
-        setPendingSync(true);
-      }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [commit]
   );
 
-  const flushSetWrite = useCallback(async (setId: string) => {
-    const timer = writeTimersRef.current.get(setId);
-    if (timer) {
-      clearTimeout(timer);
-      writeTimersRef.current.delete(setId);
-    }
-    const data = pendingWritesRef.current.get(setId);
-    if (!data) return;
-    pendingWritesRef.current.delete(setId);
-    try {
-      await supabase
-        .from("sets")
-        .update({
-          reps: data.reps,
-          weight: data.weight,
-          duration_seconds: data.duration_seconds,
-          is_warmup: data.is_warmup,
-          note: data.note,
-          e1rm: data.e1rm ?? null,
-          rest_seconds: data.rest_seconds ?? null,
-        })
-        .eq("id", setId);
-    } catch {
-      setPendingSync(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const flushAllSetWrites = useCallback(async () => {
-    const ids = [...pendingWritesRef.current.keys()];
-    await Promise.all(ids.map((id) => flushSetWrite(id)));
-  }, [flushSetWrite]);
-
   const updateSet = useCallback(
-    (workoutExerciseId: string, set: SetData) => {
-      if (!set.id) return;
-      dirtyRef.current = true;
-
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
-      );
+    (weId: string, set: SetData) => {
+      const setId = set.id;
+      const ex = findEx(weId);
+      if (!setId || !ex) return;
+      awaitingPrefillRef.current.delete(weId);
+      const old = ex.sets.find((s) => s.id === setId);
       const e1rm =
-        ex?.workoutExercise.mode === "reps_weight" && set.weight && set.reps
+        ex.workoutExercise.mode === "reps_weight" && set.weight && set.reps
           ? computeE1rm(set.weight, set.reps)
           : null;
+      let updated: SetData = { ...set, e1rm };
 
-      const updatedSet = { ...set, e1rm };
+      // Editing a logged set re-evaluates its PRs once there's signal
+      const prOps: PrOp[] = [];
+      let nextPrs = prsRef.current;
+      if (
+        old?.completed_at &&
+        (old.reps !== set.reps ||
+          old.weight !== set.weight ||
+          old.duration_seconds !== set.duration_seconds ||
+          old.is_warmup !== set.is_warmup)
+      ) {
+        prOps.push(revokeOp(ex, [setId]));
+        if (set.is_warmup) {
+          nextPrs = withoutPrs([setId]);
+          updated = {
+            ...updated,
+            is_pr_weight: false,
+            is_pr_1rm: false,
+            is_pr_volume: false,
+            is_pr_reps: false,
+            is_pr_duration: false,
+          };
+        } else {
+          prOps.push(detectOp(weId, setId));
+        }
+      }
 
-      setExercises((prev) =>
-        prev.map((e) =>
-          e.workoutExercise.id === workoutExerciseId
-            ? {
-                ...e,
-                sets: e.sets.map((s) => (s.id === set.id ? updatedSet : s)),
-              }
-            : e
-        )
-      );
-
-      // Debounce the network write until typing settles
-      const setId = set.id;
-      pendingWritesRef.current.set(setId, updatedSet);
-      const existing = writeTimersRef.current.get(setId);
-      if (existing) clearTimeout(existing);
-      writeTimersRef.current.set(
-        setId,
-        setTimeout(() => flushSetWrite(setId), 600)
+      commit(
+        {
+          exercises: mapEx(weId, (e) => ({
+            ...e,
+            sets: e.sets.map((s) => (s.id === setId ? updated : s)),
+          })),
+          prs: nextPrs,
+        },
+        { dirty: true, prOps }
       );
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [flushSetWrite]
+    [commit]
   );
 
   const completeSet = useCallback(
-    async (workoutExerciseId: string, setId: string) => {
-      dirtyRef.current = true;
-      // Make sure the set's typed values are persisted before flagging PRs on it
-      flushSetWrite(setId);
+    (weId: string, setId: string) => {
+      const ex = findEx(weId);
+      const set = ex?.sets.find((s) => s.id === setId);
+      if (!ex || !set) return;
+      awaitingPrefillRef.current.delete(weId);
       const now = new Date().toISOString();
-
-      // Capture set data before state update to avoid stale closure
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
-      );
-      const setData = ex?.sets.find((s) => s.id === setId);
 
       // Rest = time since the most recent completed set anywhere in this
       // workout. Passive data — stamped once, editable afterwards.
-      let restSeconds: number | null = null;
       let lastCompletedMs = 0;
       for (const e of exercisesRef.current) {
         for (const s of e.sets) {
@@ -588,433 +518,160 @@ export function useWorkout(workoutId: string) {
           }
         }
       }
-      if (lastCompletedMs > 0) {
-        restSeconds = Math.max(0, Math.round((Date.now() - lastCompletedMs) / 1000));
-      }
+      const restSeconds =
+        lastCompletedMs > 0
+          ? Math.max(0, Math.round((Date.now() - lastCompletedMs) / 1000))
+          : null;
+      // Prefilled sets that were checked without editing never got one
+      const e1rm =
+        ex.workoutExercise.mode === "reps_weight" && set.weight && set.reps
+          ? computeE1rm(set.weight, set.reps)
+          : (set.e1rm ?? null);
 
-      setExercises((prev) =>
-        prev.map((e) =>
-          e.workoutExercise.id === workoutExerciseId
-            ? {
-                ...e,
-                sets: e.sets.map((s) =>
-                  s.id === setId
-                    ? { ...s, completed_at: now, rest_seconds: restSeconds }
-                    : s
-                ),
-              }
-            : e
-        )
+      commit(
+        {
+          exercises: mapEx(weId, (e) => ({
+            ...e,
+            sets: e.sets.map((s) =>
+              s.id === setId
+                ? { ...s, completed_at: now, rest_seconds: restSeconds, e1rm }
+                : s
+            ),
+          })),
+        },
+        { dirty: true, prOps: set.is_warmup ? [] : [detectOp(weId, setId)] }
       );
-
-      try {
-        await supabase
-          .from("sets")
-          .update({ completed_at: now, rest_seconds: restSeconds })
-          .eq("id", setId);
-      } catch {
-        setPendingSync(true);
-      }
-      if (
-        ex &&
-        setData &&
-        !setData.is_warmup &&
-        userIdRef.current &&
-        workout
-      ) {
-        const userId = userIdRef.current;
-        const gymId = workout.gym_id;
-        queuePrOp(async () => {
-          const detected = await detectPRs({
-            supabase,
-            setData,
-            exerciseId: ex.definition.id,
-            equipment: ex.definition.equipment,
-            mode: ex.workoutExercise.mode,
-            gymId,
-            workoutId,
-            setId,
-            userId,
-          });
-          if (detected.length === 0) return;
-
-          haptic(HAPTIC.pr);
-          const detectedTypes = detected.map((d) => d.prType);
-          setPrs((prev) => {
-            const next = { ...prev, [setId]: detectedTypes };
-            // Read current sets from the ref so rapid completions see fresh state
-            const curEx = exercisesRef.current.find(
-              (e) => e.workoutExercise.id === workoutExerciseId
-            );
-            for (const s of curEx?.sets || []) {
-              if (!s.id || s.id === setId || !s.completed_at || !prev[s.id]) continue;
-              const remaining = prev[s.id].filter((t: PrType) => !detectedTypes.includes(t));
-              if (remaining.length === 0) delete next[s.id];
-              else next[s.id] = remaining;
-            }
-            return next;
-          });
-
-          await savePRs({
-            supabase,
-            detectedPRs: detected,
-            exerciseId: ex.definition.id,
-            equipment: ex.definition.equipment,
-            setId,
-            workoutId,
-            gymId,
-            userId,
-            setData,
-            mode: ex.workoutExercise.mode,
-          });
-
-          // Clear superseded flags on this exercise's other sets in DB
-          const clearFlags: Database["public"]["Tables"]["sets"]["Update"] = {};
-          for (const t of detectedTypes) {
-            const flag = PR_FLAG_MAP[t] as keyof typeof clearFlags;
-            (clearFlags as Record<string, boolean>)[flag] = false;
-          }
-          const curEx = exercisesRef.current.find(
-            (e) => e.workoutExercise.id === workoutExerciseId
-          );
-          const supersededIds = (curEx?.sets || [])
-            .filter((s) => s.id && s.id !== setId && s.completed_at)
-            .map((s) => s.id!);
-          if (supersededIds.length > 0) {
-            await supabase.from("sets").update(clearFlags).in("id", supersededIds);
-          }
-        });
-      }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [workoutId, workout]
+    [commit]
   );
 
   const uncompleteSet = useCallback(
-    async (workoutExerciseId: string, setId: string) => {
-      dirtyRef.current = true;
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
+    (weId: string, setId: string) => {
+      const ex = findEx(weId);
+      const set = ex?.sets.find((s) => s.id === setId);
+      if (!ex || !set) return;
+      commit(
+        {
+          exercises: mapEx(weId, (e) => ({
+            ...e,
+            sets: e.sets.map((s) =>
+              s.id === setId
+                ? {
+                    ...s,
+                    completed_at: null,
+                    rest_seconds: null,
+                    is_pr_weight: false,
+                    is_pr_1rm: false,
+                    is_pr_volume: false,
+                    is_pr_reps: false,
+                    is_pr_duration: false,
+                  }
+                : s
+            ),
+          })),
+          prs: withoutPrs([setId]),
+        },
+        // Revoke its PRs and restore whatever it had superseded
+        { dirty: true, prOps: set.is_warmup ? [] : [revokeOp(ex, [setId])] }
       );
-
-      setExercises((prev) =>
-        prev.map((e) =>
-          e.workoutExercise.id === workoutExerciseId
-            ? {
-                ...e,
-                sets: e.sets.map((s) =>
-                  s.id === setId
-                    ? {
-                        ...s,
-                        completed_at: null,
-                        rest_seconds: null,
-                        is_pr_weight: false,
-                        is_pr_1rm: false,
-                        is_pr_volume: false,
-                        is_pr_reps: false,
-                        is_pr_duration: false,
-                      }
-                    : s
-                ),
-              }
-            : e
-        )
-      );
-
-      setPrs((prev) => {
-        const next = { ...prev };
-        delete next[setId];
-        return next;
-      });
-
-      try {
-        await supabase
-          .from("sets")
-          .update({
-            completed_at: null,
-            rest_seconds: null,
-            is_pr_weight: false,
-            is_pr_1rm: false,
-            is_pr_volume: false,
-            is_pr_reps: false,
-            is_pr_duration: false,
-          })
-          .eq("id", setId);
-      } catch {
-        setPendingSync(true);
-      }
-
-      // Revoke this set's PR contributions and restore whatever it superseded
-      if (ex && userIdRef.current && workoutRef.current) {
-        const userId = userIdRef.current;
-        const gymId = workoutRef.current.gym_id;
-        queuePrOp(async () => {
-          const restored = await revokeAndRecomputePRs({
-            supabase,
-            userId,
-            exerciseId: ex.definition.id,
-            equipment: ex.definition.equipment,
-            gymId,
-            removedSetIds: [setId],
-          });
-          applyRestoredBadges(restored);
-        });
-      }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [commit]
   );
 
   const deleteSet = useCallback(
-    async (workoutExerciseId: string, setId: string) => {
-      dirtyRef.current = true;
-      // Cancel any pending debounced write — it would resurrect the row
-      const timer = writeTimersRef.current.get(setId);
-      if (timer) clearTimeout(timer);
-      writeTimersRef.current.delete(setId);
-      pendingWritesRef.current.delete(setId);
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
-      );
-      const isLastSet = ex && ex.sets.length === 1;
-      const deletedSet = ex?.sets.find((s) => s.id === setId);
-
-      if (isLastSet) {
-        setExercises((prev) =>
-          prev.filter((e) => e.workoutExercise.id !== workoutExerciseId)
-        );
-      } else {
-        setExercises((prev) =>
-          prev.map((e) =>
-            e.workoutExercise.id === workoutExerciseId
-              ? { ...e, sets: e.sets.filter((s) => s.id !== setId) }
-              : e
-          )
-        );
-      }
-      setPrs((prev) => {
-        if (!prev[setId]) return prev;
-        const next = { ...prev };
-        delete next[setId];
-        return next;
-      });
-
-      const userId = userIdRef.current;
-      const gymId = workoutRef.current?.gym_id ?? null;
-      queuePrOp(async () => {
-        try {
-          // Revoke PRs BEFORE deleting the set — the FK nulls on delete
-          if (ex && userId && deletedSet?.completed_at) {
-            const restored = await revokeAndRecomputePRs({
-              supabase,
-              userId,
-              exerciseId: ex.definition.id,
-              equipment: ex.definition.equipment,
-              gymId,
-              removedSetIds: [setId],
-            });
-            applyRestoredBadges(restored);
-          }
-          await supabase.from("sets").delete().eq("id", setId);
-          if (isLastSet) {
-            await supabase.from("workout_exercises").delete().eq("id", workoutExerciseId);
-          }
-        } catch {
-          setPendingSync(true);
+    (weId: string, setId: string) => {
+      const ex = findEx(weId);
+      if (!ex) return;
+      const deleted = ex.sets.find((s) => s.id === setId);
+      // Deleting the last set removes the exercise
+      const next =
+        ex.sets.length === 1
+          ? exercisesRef.current.filter((e) => e.workoutExercise.id !== weId)
+          : mapEx(weId, (e) => ({ ...e, sets: e.sets.filter((s) => s.id !== setId) }));
+      commit(
+        { exercises: next, prs: withoutPrs([setId]) },
+        {
+          dirty: true,
+          prOps:
+            deleted?.completed_at && !deleted.is_warmup ? [revokeOp(ex, [setId])] : [],
         }
-      });
+      );
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [commit]
   );
 
   const removeExercise = useCallback(
-    async (workoutExerciseId: string) => {
-      dirtyRef.current = true;
-      const ex = exercisesRef.current.find(
-        (e) => e.workoutExercise.id === workoutExerciseId
-      );
-      const completedSetIds = (ex?.sets || [])
+    (weId: string) => {
+      const ex = findEx(weId);
+      if (!ex) return;
+      const completedSetIds = ex.sets
         .filter((s) => s.id && s.completed_at)
         .map((s) => s.id!);
-
-      setExercises((prev) =>
-        prev.filter((e) => e.workoutExercise.id !== workoutExerciseId)
+      commit(
+        {
+          exercises: exercisesRef.current.filter((e) => e.workoutExercise.id !== weId),
+          prs: withoutPrs(completedSetIds),
+        },
+        {
+          dirty: true,
+          prOps: completedSetIds.length ? [revokeOp(ex, completedSetIds)] : [],
+        }
       );
-      if (completedSetIds.length > 0) {
-        setPrs((prev) => {
-          const next = { ...prev };
-          for (const sid of completedSetIds) delete next[sid];
-          return next;
-        });
-      }
-
-      const userId = userIdRef.current;
-      const gymId = workoutRef.current?.gym_id ?? null;
-      queuePrOp(async () => {
-        try {
-          if (ex && userId && completedSetIds.length > 0) {
-            const restored = await revokeAndRecomputePRs({
-              supabase,
-              userId,
-              exerciseId: ex.definition.id,
-              equipment: ex.definition.equipment,
-              gymId,
-              removedSetIds: completedSetIds,
-            });
-            applyRestoredBadges(restored);
-          }
-          await supabase
-            .from("sets")
-            .delete()
-            .eq("workout_exercise_id", workoutExerciseId);
-          await supabase
-            .from("workout_exercises")
-            .delete()
-            .eq("id", workoutExerciseId);
-        } catch {
-          setPendingSync(true);
-        }
-      });
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
-  );
-
-  const finishWorkout = useCallback(async () => {
-    const now = new Date().toISOString();
-    setWorkout((prev) => (prev ? { ...prev, finished_at: now } : prev));
-
-    await flushAllSetWrites();
-
-    let allSynced = !pendingSync;
-    try {
-      await supabase
-        .from("workouts")
-        .update({ finished_at: now })
-        .eq("id", workoutId);
-
-      if (pendingSync) {
-        const w = workoutRef.current;
-        if (w) {
-          const synced = await syncToSupabase(supabase, {
-            workout: { ...w, finished_at: now },
-            exercises: exercisesRef.current,
-          });
-          if (synced) {
-            setPendingSync(false);
-            allSynced = true;
-          }
-        }
-      }
-    } catch {
-      setPendingSync(true);
-      allSynced = false;
-    }
-
-    // Only drop the local mirror once everything made it to the server —
-    // the offline summary view depends on it otherwise
-    if (allSynced) {
-      clearCachedWorkout(workoutId);
-    }
-    try { localStorage.removeItem("active_workout_id"); } catch {}
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workoutId, pendingSync]);
-
-  const renameWorkout = useCallback(
-    async (title: string) => {
-      dirtyRef.current = true;
-      setWorkout((prev) => (prev ? { ...prev, title } : prev));
-      try {
-        await supabase
-          .from("workouts")
-          .update({ title })
-          .eq("id", workoutId);
-      } catch {
-        setPendingSync(true);
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [workoutId]
+    [commit]
   );
 
   const reorderExercises = useCallback(
-    async (fromIndex: number, toIndex: number) => {
-      dirtyRef.current = true;
-      setExercises((prev) => {
-        const updated = [...prev];
-        const [moved] = updated.splice(fromIndex, 1);
-        updated.splice(toIndex, 0, moved);
-        return updated;
-      });
-
-      const currentExercises = [...exercisesRef.current];
-      const [moved] = currentExercises.splice(fromIndex, 1);
-      currentExercises.splice(toIndex, 0, moved);
-
-      try {
-        for (let i = 0; i < currentExercises.length; i++) {
-          await supabase
-            .from("workout_exercises")
-            .update({ sort_order: i })
-            .eq("id", currentExercises[i].workoutExercise.id);
-        }
-      } catch {
-        setPendingSync(true);
-      }
+    (fromIndex: number, toIndex: number) => {
+      const next = [...exercisesRef.current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      commit(
+        {
+          exercises: next.map((e, i) =>
+            e.workoutExercise.sort_order === i
+              ? e
+              : { ...e, workoutExercise: { ...e.workoutExercise, sort_order: i } }
+          ),
+        },
+        { dirty: true }
+      );
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [commit]
   );
 
+  const renameWorkout = useCallback(
+    (title: string) => {
+      const w = workoutRef.current;
+      if (!w) return;
+      commit({ workout: { ...w, title } }, { dirty: true });
+    },
+    [commit]
+  );
+
+  const finishWorkout = useCallback(async () => {
+    const w = workoutRef.current;
+    if (!w) return;
+    const finished = { ...w, finished_at: new Date().toISOString() };
+    setActivePointer(null);
+    await commit({ workout: finished }, { dirty: true });
+    // Next workout at this gym ghosts off this one, even before it syncs
+    await recordFinishedWorkout(finished, exercisesRef.current);
+  }, [commit]);
+
   const cancelWorkout = useCallback(async () => {
-    // Drop any pending debounced writes — everything is being deleted
-    for (const timer of writeTimersRef.current.values()) clearTimeout(timer);
-    writeTimersRef.current.clear();
-    pendingWritesRef.current.clear();
-    clearCachedWorkout(workoutId);
-    try { localStorage.removeItem("active_workout_id"); } catch {}
-
-    try {
-      // Revoke each exercise's PR contributions and restore superseded records
-      const userId = userIdRef.current;
-      const gymId = workoutRef.current?.gym_id ?? null;
-      if (userId) {
-        for (const ex of exercisesRef.current) {
-          const setIds = ex.sets.filter((s) => s.id).map((s) => s.id!);
-          if (setIds.length === 0) continue;
-          await revokeAndRecomputePRs({
-            supabase,
-            userId,
-            exerciseId: ex.definition.id,
-            equipment: ex.definition.equipment,
-            gymId,
-            removedSetIds: setIds,
-          });
-        }
-      }
-      // Safety net for anything not covered above
-      await supabase.from("pr_snapshots").delete().eq("workout_id", workoutId);
-      await supabase.from("personal_records").delete().eq("workout_id", workoutId);
-
-      const weIds = exercisesRef.current.map((e) => e.workoutExercise.id);
-      if (weIds.length) {
-        await supabase.from("sets").delete().in("workout_exercise_id", weIds);
-        await supabase.from("workout_exercises").delete().in("id", weIds);
-      }
-      await supabase.from("workouts").delete().eq("id", workoutId);
-    } catch {}
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workoutId]);
+    setActivePointer(null);
+    // Tombstone: the sync engine revokes its PRs and deletes it server-side
+    await commit({}, { dirty: false, deleted: true });
+  }, [commit]);
 
   return {
     workout,
     exercises,
     loading,
+    unavailable,
     elapsed,
     prs,
-    isOffline,
-    pendingSync,
     addExercise,
     addSet,
     updateSet,

@@ -8,6 +8,7 @@ import {
 } from "@/types/database.types";
 import { SetData } from "@/components/workout/set-row";
 import { PR_FLAG_MAP } from "./pr-constants";
+import { check, softCheck } from "./sync-errors";
 
 export interface DetectedPR {
   prType: PrType;
@@ -139,7 +140,7 @@ export async function detectPRs(
 
   let query = supabase
     .from("personal_records")
-    .select("pr_type, value, pr_scope, gym_id")
+    .select("pr_type, value, previous_value, set_id, pr_scope, gym_id")
     .eq("user_id", userId)
     .eq("exercise_id", exerciseId);
 
@@ -149,14 +150,16 @@ export async function detectPRs(
     query = query.eq("pr_scope", "global");
   }
 
-  const { data: currentPRs, error: prError } = await query;
-  if (prError) {
-    throw new Error(`personal_records query: ${prError.message}`);
-  }
-  const prMap = new Map<string, number>();
+  const { data: currentPRs } = check(await query, "personal_records query");
+  const prMap = new Map<string, number | null>();
   if (currentPRs) {
     for (const pr of currentPRs) {
-      prMap.set(pr.pr_type, pr.value);
+      // A record this same set already holds (a retried sync) competes with
+      // what it beat, not with itself.
+      prMap.set(
+        pr.pr_type,
+        pr.set_id === params.setId ? pr.previous_value : pr.value
+      );
     }
   }
 
@@ -223,13 +226,10 @@ export async function savePRs(params: {
       ? computeE1rm(setData.weight, setData.reps)
       : null;
 
-  const { error: setUpdateErr } = await supabase
-    .from("sets")
-    .update({ ...flagUpdates, e1rm })
-    .eq("id", setId);
-  if (setUpdateErr) {
-    console.error("[PR] sets update failed:", setUpdateErr.message);
-  }
+  softCheck(
+    await supabase.from("sets").update({ ...flagUpdates, e1rm }).eq("id", setId),
+    "[PR] sets update"
+  );
 
   const contextJson = {
     weight: setData.weight,
@@ -280,32 +280,45 @@ export async function savePRs(params: {
       existingQuery = existingQuery.eq("gym_id", gymId);
     }
 
-    const { data: existing, error: lookupErr } = await existingQuery.limit(1);
-    if (lookupErr) {
-      console.error("[PR] lookup failed:", lookupErr.message);
-      continue;
-    }
+    const lookup = await existingQuery.limit(1);
+    if (!softCheck(lookup, "[PR] lookup")) continue;
+    const existing = lookup.data;
 
     if (existing && existing.length > 0) {
-      const { error: updateErr } = await supabase
-        .from("personal_records")
-        .update(recordData)
-        .eq("id", existing[0].id);
-      if (updateErr) console.error("[PR] update personal_records failed:", updateErr.message);
+      softCheck(
+        await supabase
+          .from("personal_records")
+          .update(recordData)
+          .eq("id", existing[0].id),
+        "[PR] update personal_records"
+      );
     } else {
-      const { error: insertErr } = await supabase.from("personal_records").insert({
+      softCheck(
+        await supabase.from("personal_records").insert({
+          user_id: userId,
+          exercise_id: exerciseId,
+          ...recordData,
+        }),
+        "[PR] insert personal_records"
+      );
+    }
+
+    // Replace rather than append, so a retried sync can't double-log the PR
+    softCheck(
+      await supabase
+        .from("pr_snapshots")
+        .delete()
+        .eq("set_id", setId)
+        .eq("pr_type", pr.prType),
+      "[PR] clear pr_snapshots"
+    );
+    softCheck(
+      await supabase.from("pr_snapshots").insert({
         user_id: userId,
         exercise_id: exerciseId,
         ...recordData,
-      });
-      if (insertErr) console.error("[PR] insert personal_records failed:", insertErr.message);
-    }
-
-    const { error: snapErr } = await supabase.from("pr_snapshots").insert({
-      user_id: userId,
-      exercise_id: exerciseId,
-      ...recordData,
-    });
-    if (snapErr) console.error("[PR] insert pr_snapshots failed:", snapErr.message);
+      }),
+      "[PR] insert pr_snapshots"
+    );
   }
 }

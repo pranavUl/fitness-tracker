@@ -1,7 +1,14 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { createClient, getLocalUser } from "@/lib/supabase/client";
+import { createClient, getUserId } from "@/lib/supabase/client";
+import { queueDelete, queueUpdate, queueUpsert } from "@/lib/offline";
+import {
+  getCachedGyms,
+  putCachedRow,
+  refreshGyms,
+  removeCachedRow,
+} from "@/lib/reference-data";
 import { Database } from "@/types/database.types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -33,12 +40,14 @@ export function GymList() {
   const supabase = createClient();
 
   async function loadGyms() {
-    const { data } = await supabase
-      .from("gyms")
-      .select("*")
-      .order("is_default", { ascending: false })
-      .order("name");
-    setGyms(data || []);
+    // Phone first, then refresh if there's signal
+    const cached = await getCachedGyms();
+    if (cached) {
+      setGyms(cached);
+      setLoading(false);
+    }
+    const fresh = await refreshGyms(supabase);
+    if (fresh) setGyms(fresh);
     setLoading(false);
   }
 
@@ -67,45 +76,52 @@ export function GymList() {
 
   async function handleSave() {
     setSaving(true);
-    const user = await getLocalUser(supabase);
-    if (!user) return;
+    const userId = await getUserId(supabase);
+    if (!userId) {
+      setSaving(false);
+      return;
+    }
 
+    const fields = {
+      name,
+      location: location || null,
+      notes: notes || null,
+      is_default: isDefault,
+    };
+    let gym: Gym;
     if (editingGym) {
-      await supabase
-        .from("gyms")
-        .update({
-          name,
-          location: location || null,
-          notes: notes || null,
-          is_default: isDefault,
-        })
-        .eq("id", editingGym.id);
+      gym = { ...editingGym, ...fields };
+      await queueUpdate("gyms", gym.id, fields);
     } else {
-      await supabase.from("gyms").insert({
-        user_id: user.id,
-        name,
-        location: location || null,
-        notes: notes || null,
-        is_default: isDefault,
-      });
+      gym = {
+        id: crypto.randomUUID(),
+        user_id: userId,
+        created_at: new Date().toISOString(),
+        ...fields,
+      };
+      await queueUpsert("gyms", gym);
     }
+    await putCachedRow("gyms", gym);
 
+    // Only one default gym
     if (isDefault) {
-      const currentId = editingGym?.id;
-      await supabase
-        .from("gyms")
-        .update({ is_default: false })
-        .neq("id", currentId || "");
+      for (const g of gyms) {
+        if (g.id !== gym.id && g.is_default) {
+          await queueUpdate("gyms", g.id, { is_default: false });
+          await putCachedRow("gyms", { ...g, is_default: false });
+        }
+      }
     }
 
+    setGyms((await getCachedGyms()) ?? []);
     setSaving(false);
     setOpen(false);
-    loadGyms();
   }
 
   async function handleDelete(id: string) {
-    await supabase.from("gyms").delete().eq("id", id);
-    loadGyms();
+    await queueDelete("gyms", id);
+    await removeCachedRow("gyms", id);
+    setGyms((prev) => prev.filter((g) => g.id !== id));
   }
 
   if (loading) {

@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useState, useEffect, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { loadCachedWorkout } from "@/lib/offline";
+import { getCachedGyms } from "@/lib/reference-data";
 import { Database, TrackingMode, PrType } from "@/types/database.types";
 import { Button } from "@/components/ui/button";
 import {
@@ -68,11 +69,29 @@ function formatSetValue(
   }
 }
 
+function SummarySkeleton() {
+  return (
+    <div className="mx-auto max-w-lg px-4 pt-12">
+      <div className="space-y-4">
+        <div className="h-10 w-48 animate-pulse rounded-lg bg-muted mx-auto" />
+        <div className="h-32 animate-pulse rounded-2xl bg-muted" />
+      </div>
+    </div>
+  );
+}
+
 export default function WorkoutSummaryPage() {
-  const params = useParams();
+  return (
+    <Suspense fallback={<SummarySkeleton />}>
+      <WorkoutSummary />
+    </Suspense>
+  );
+}
+
+function WorkoutSummary() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const workoutId = params.id as string;
+  const workoutId = searchParams.get("id") ?? "";
   const justFinished = searchParams.get("finished") === "1";
 
   const [loading, setLoading] = useState(true);
@@ -91,13 +110,19 @@ export default function WorkoutSummaryPage() {
   const supabase = createClient();
 
   useEffect(() => {
-    // Offline fallback — build the summary from the local workout mirror
+    // The phone's copy is always at least as new as the server's, and
+    // needs no signal — use it whenever it exists.
     async function loadFromCache(): Promise<boolean> {
       const cached = await loadCachedWorkout(workoutId);
-      if (!cached) return false;
+      if (!cached || cached.deleted) return false;
 
       setTitle(cached.workout.title || "Workout");
       setStartedAt(cached.workout.started_at);
+      if (cached.workout.gym_id) {
+        const gyms = await getCachedGyms();
+        const gym = gyms?.find((g) => g.id === cached.workout.gym_id);
+        if (gym) setGymName(gym.name);
+      }
       if (cached.workout.finished_at) {
         const ms =
           new Date(cached.workout.finished_at).getTime() -
@@ -153,24 +178,25 @@ export default function WorkoutSummaryPage() {
     }
 
     async function load() {
-      let workout: Database["public"]["Tables"]["workouts"]["Row"] | null;
-      try {
-        const { data } = await supabase
-          .from("workouts")
-          .select("*")
-          .eq("id", workoutId)
-          .single();
-        workout = data;
-      } catch {
-        // Offline — try the local mirror before giving up
-        const ok = await loadFromCache();
-        if (!ok) setLoading(false);
+      if (!workoutId) {
+        router.push("/");
         return;
       }
+      if (await loadFromCache()) return;
 
+      const { data: workout, error } = await supabase
+        .from("workouts")
+        .select("*")
+        .eq("id", workoutId)
+        .maybeSingle();
+      if (error) {
+        // No signal and not on this phone — show an empty summary
+        setTitle("Workout");
+        setLoading(false);
+        return;
+      }
       if (!workout) {
-        const ok = await loadFromCache();
-        if (!ok) router.push("/");
+        router.push("/");
         return;
       }
 
@@ -305,16 +331,7 @@ export default function WorkoutSummaryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workoutId, router]);
 
-  if (loading) {
-    return (
-      <div className="mx-auto max-w-lg px-4 pt-12">
-        <div className="space-y-4">
-          <div className="h-10 w-48 animate-pulse rounded-lg bg-muted mx-auto" />
-          <div className="h-32 animate-pulse rounded-2xl bg-muted" />
-        </div>
-      </div>
-    );
-  }
+  if (loading) return <SummarySkeleton />;
 
   return (
     <div className="mx-auto max-w-lg px-4 pt-8 pb-24">
