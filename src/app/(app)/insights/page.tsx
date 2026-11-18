@@ -7,6 +7,7 @@ import { getEquipmentScope } from "@/lib/pr-detection";
 import { kvGet, kvSet, listOutbox } from "@/lib/offline";
 import { cn } from "@/lib/utils";
 import { MealTimingCard } from "@/components/meal-timing-card";
+import { computeOpenDay, dayStart, shiftDay } from "@/lib/nutrition-day";
 import {
   LineChart,
   Line,
@@ -483,10 +484,14 @@ export default function InsightsPage() {
   const body = useMemo(() => {
     const trend = weightTrend(data.daily);
     const byDate = new Map(data.daily.map((d) => [d.date, d]));
-    const today = new Date();
+    // Protein/carbs end at the last finished day — the open day is still
+    // being logged, so its partial total would read as a dip. Weight is a
+    // morning reading, so today's counts.
+    const end =
+      bodyMetric === "weight" ? new Date() : dayStart(shiftDay(computeOpenDay(), -1));
     const rows: BodyRow[] = [];
     for (let i = bodyRange - 1; i >= 0; i--) {
-      const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+      const d = new Date(end.getFullYear(), end.getMonth(), end.getDate() - i);
       const iso = dateKey(d);
       const entry = byDate.get(iso);
       rows.push({
@@ -497,7 +502,12 @@ export default function InsightsPage() {
       });
     }
     const logged = rows.filter((r) => r.value != null);
-    const todayValue = rows[rows.length - 1].value;
+    const latest = rows[rows.length - 1];
+    const todayValue = latest.value;
+    const now = new Date();
+    const yesterday = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
+    const latestLabel =
+      latest.iso === yesterday ? "Yesterday" : latest.label;
     const last7 = rows.slice(-7).filter((r) => r.value != null);
     const avg7 = last7.length
       ? Math.round(last7.reduce((a, r) => a + r.value!, 0) / last7.length)
@@ -518,7 +528,7 @@ export default function InsightsPage() {
       const span = (lastDate.getTime() - isoNoon(base[0]).getTime()) / 86400000;
       if (span >= 5) ratePerWeek = Math.round(((lastTrend - base[1]) / span) * 7 * 10) / 10;
     }
-    return { rows, logged: logged.length, todayValue, avg7, latestTrend, ratePerWeek };
+    return { rows, logged: logged.length, todayValue, latestLabel, avg7, latestTrend, ratePerWeek };
   }, [data.daily, bodyMetric, bodyRange]);
 
   if (loading) {
@@ -834,7 +844,7 @@ export default function InsightsPage() {
                   {body.todayValue != null ? `${body.todayValue}${metric.unit}` : "—"}
                 </p>
                 <p className="text-[10px] text-muted-foreground uppercase tracking-wide">
-                  Today
+                  {body.latestLabel}
                 </p>
               </div>
               <div className="rounded-lg bg-muted/30 px-3 py-2">
