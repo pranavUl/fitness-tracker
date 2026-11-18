@@ -6,6 +6,9 @@ import { getPendingRow, kvGet, kvSet, queueUpsert } from "@/lib/offline";
 import { Input } from "@/components/ui/input";
 import { Check, ChevronLeft, ChevronRight, Flame, Weight, Wheat } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { computeOpenDay, dayKey, FINISHED_KEY, readFinished, shiftDay } from "@/lib/nutrition-day";
+import { recordIntake } from "@/lib/intake";
+import { IntakePace } from "@/components/intake-pace";
 
 type Values = { protein: number | null; carbs: number | null; weight: number | null };
 const EMPTY: Values = { protein: null, carbs: null, weight: null };
@@ -15,42 +18,7 @@ const FIELD: Record<keyof Values, "protein_grams" | "carbs_grams" | "morning_wei
   weight: "morning_weight",
 };
 
-// Last day the user tapped "Finish day" on (YYYY-MM-DD). Device-local.
-const FINISHED_KEY = "daily_finished_through";
 const MAX_DAYS_BACK = 90;
-
-function dayKey(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function shiftDay(key: string, delta: number): string {
-  const [y, m, d] = key.split("-").map(Number);
-  return dayKey(new Date(y, m - 1, d + delta));
-}
-
-function readFinished(): string | null {
-  try {
-    return localStorage.getItem(FINISHED_KEY);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The day new entries belong to. It does NOT change at midnight: it stays
- * on a day until that day is finished, so late-night food still counts.
- * Never older than yesterday (so a forgotten "Finish" can't strand entries
- * days back) and never in the future.
- */
-function computeOpenDay(): string {
-  const today = dayKey(new Date());
-  const yesterday = shiftDay(today, -1);
-  const finished = readFinished();
-  let open = finished ? shiftDay(finished, 1) : today;
-  if (open < yesterday) open = yesterday;
-  if (open > today) open = today;
-  return open;
-}
 
 function dayLabel(key: string): string {
   const today = dayKey(new Date());
@@ -79,6 +47,10 @@ export function DailyTracker() {
   const editedRef = useRef<Set<keyof Values>>(new Set());
   const dayRef = useRef<string | null>(null);
   const openDayRef = useRef<string | null>(null);
+  const valuesRef = useRef<Values>(EMPTY);
+  useEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
 
   // Follow the open day (on load, at midnight, and when reopened), unless
   // the user has paged to a different day on purpose
@@ -175,6 +147,12 @@ export function DailyTracker() {
       );
       const cached = (await kvGet<Values>(`daily:${d}`)) ?? EMPTY;
       await kvSet(`daily:${d}`, { ...cached, [field]: value });
+      // Timestamp the running totals for meal pacing — only for food being
+      // logged now, not fixes to past days
+      if (field !== "weight" && d === openDayRef.current) {
+        const cur = { ...valuesRef.current, [field]: value };
+        await recordIntake(d, cur.protein, cur.carbs);
+      }
     },
     []
   );
@@ -309,6 +287,8 @@ export function DailyTracker() {
           </div>
         ))}
       </div>
+
+      {isOpenDay && <IntakePace openDay={openDay} protein={values.protein} carbs={values.carbs} />}
     </div>
   );
 }

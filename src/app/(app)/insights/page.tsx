@@ -6,6 +6,7 @@ import { Equipment } from "@/types/database.types";
 import { getEquipmentScope } from "@/lib/pr-detection";
 import { kvGet, kvSet, listOutbox } from "@/lib/offline";
 import { cn } from "@/lib/utils";
+import { MealTimingCard } from "@/components/meal-timing-card";
 import {
   LineChart,
   Line,
@@ -957,6 +958,8 @@ export default function InsightsPage() {
           </p>
         )}
       </div>
+
+      <MealTimingCard />
     </div>
   );
 }

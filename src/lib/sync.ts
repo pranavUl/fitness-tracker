@@ -218,6 +218,7 @@ const TABLE_PRIORITY: Record<OutboxTable, number> = {
   exercise_definitions: 1,
   workouts: 2,
   daily_tracking: 2,
+  intake_log: 2,
   run_sessions: 2,
 };
 

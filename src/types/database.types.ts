@@ -333,6 +333,36 @@ export interface Database {
         };
         Relationships: [];
       };
+      intake_log: {
+        Row: {
+          id: string;
+          user_id: string;
+          date: string;
+          logged_at: string;
+          protein_grams: number | null;
+          carbs_grams: number | null;
+          created_at: string;
+        };
+        Insert: {
+          id: string;
+          user_id: string;
+          date: string;
+          logged_at: string;
+          protein_grams?: number | null;
+          carbs_grams?: number | null;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          user_id?: string;
+          date?: string;
+          logged_at?: string;
+          protein_grams?: number | null;
+          carbs_grams?: number | null;
+          created_at?: string;
+        };
+        Relationships: [];
+      };
       run_sessions: {
         Row: {
           id: string;

@@ -323,6 +323,7 @@ export type OutboxTable =
   | "exercise_pools"
   | "exercise_definitions"
   | "daily_tracking"
+  | "intake_log"
   | "run_sessions"
   | "workouts";
 
